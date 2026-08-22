@@ -1,0 +1,48 @@
+# macOS and editor files
+.DS_Store
+._*
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+
+# Arduino and embedded build output
+build/
+build-*/
+**/build/
+.arduinoIDE/
+.pio/
+*.bin
+*.elf
+*.hex
+*.map
+*.uf2
+*.o
+*.a
+*.d
+
+# Local caches and generated backups
+*.cache
+*.cache.json
+*.cloud-unreadable-backup
+*.ancs-edit
+*.bak
+*.tmp
+
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+secrets.h
+credentials.h
+credentials.json
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Logs and test output
+*.log
+coverage/
+
