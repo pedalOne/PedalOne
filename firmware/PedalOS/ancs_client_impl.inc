@@ -88,6 +88,31 @@ void AncsClient::begin(const char *deviceName) {
   startAdvertising();
 }
 
+void AncsClient::endForLightSleep() {
+  // Stop NimBLE without releasing controller memory so begin() can recreate
+  // the GATT server after light sleep. Clear per-connection state because all
+  // handles and service pointers become invalid during deinitialization.
+  BLEDevice::deinit(false);
+  server_ = nullptr;
+  connHandle_ = 0xffff;
+  negotiatedMtu_ = 23;
+  connectionIntervalUnits_ = 0;
+  serviceStart_ = serviceEnd_ = 0;
+  notificationSource_ = controlPoint_ = dataSource_ = 0;
+  notificationCccd_ = dataCccd_ = 0;
+  shouldDiscover_ = false;
+  responseChanged_ = false;
+  requestInFlight_ = false;
+  currentRemoved_ = false;
+  ready_ = false;
+  fetchStage_ = FetchAppId;
+  responseLength_ = 0;
+  queueCount_ = 0;
+  current_ = AncsNotification();
+  currentEvent_ = PendingEvent();
+  if (stateCallback_) stateCallback_(Disconnected);
+}
+
 void AncsClient::startAdvertising() {
   BLEAdvertising *advertising = BLEDevice::getAdvertising();
   advertising->stop();

@@ -1,7 +1,7 @@
-# RAC9000 BLE firmware update protocol
+# PedalOne BLE firmware update protocol
 
 Firmware `2.1.0` adds application-image updates over the existing iPhone BLE
-connection. The phone downloads and authenticates the image; the RAC9000 writes
+connection. The phone downloads and authenticates the image; PedalOne writes
 it to the inactive ESP32 OTA partition and selects it only after validation.
 
 The first OTA-enabled build must be installed over USB with the
@@ -52,10 +52,10 @@ Possible errors are `BAD_COMMAND`, `BAD_BEGIN`, `BUSY`, `NOT_SAFE`,
 
 ```json
 {
-  "version": "2.1.0",
-  "url": "https://github.com/OWNER/REPO/releases/download/v2.1.0/rac9000.bin",
-  "size": 931671,
-  "sha256": "64 lowercase hexadecimal characters"
+  "version": "2.1.6",
+  "url": "https://github.com/pedalOne/PedalOne/releases/download/v2.1.6/PedalOne-2.1.6.bin",
+  "size": 930240,
+  "sha256": "4ba4421cac23038ad93f9f6c035f9b5581c242b67aa91451725b134ed130470c"
 }
 ```
 

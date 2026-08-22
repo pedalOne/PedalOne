@@ -16,6 +16,7 @@
 #include <esp_sleep.h>
 #include <FFat.h>
 #include <Preferences.h>
+#include "recovered_rides_2_0_21.h"
 #include <math.h>
 #include <time.h>
 
@@ -27,11 +28,13 @@
 #include <Fonts/FreeSansBold18pt7b.h>
 #include <Fonts/FreeSansBold24pt7b.h>
 
+#include "Arial_Bold72pt7b.h"
+#include "Arial_Bold92pt7b.h"
 #include "ancs_client.h"
 #include "ota_update.h"
 #include "pin_config.h"
 
-// Waveshare ESP32-S3-Touch-AMOLED-1.75 port of M5Dial Bike Computer.
+// PedalOne bike computer firmware for the ESP32-S3-Touch-AMOLED-1.75.
 // Touch: swipe left/right to rotate, tap to click. BOOT long-press replaces
 // the M5Dial long-press action.
 
@@ -66,8 +69,9 @@ constexpr uint16_t SUMMARY_PINK = 0xFBB8;
 constexpr uint16_t MUSHROOM_RED = 0xFA64;
 constexpr uint16_t MUSHROOM_TAN = 0xDDB0;
 
-constexpr char BLE_DEVICE_NAME[] = "RAC9000";
-constexpr char FW_VERSION[] = "2.1.1";
+constexpr char BLE_DEVICE_NAME[] = "PedalOne";
+constexpr char LEGACY_BLE_DEVICE_NAME[] = "RAC9000";
+constexpr char FW_VERSION[] = "2.1.6";
 constexpr char BLE_SERVICE_UUID[] = "8E400001-F315-4F60-9FB8-838830DAEA50";
 constexpr char BLE_LOCATION_UUID[] = "8E400002-F315-4F60-9FB8-838830DAEA50";
 constexpr char BLE_STATUS_UUID[] = "8E400003-F315-4F60-9FB8-838830DAEA50";
@@ -183,6 +187,8 @@ uint32_t ridePreviousMs = 0;
 uint32_t stationarySinceMs = 0;
 uint32_t zeroSpeedSinceMs = 0;
 uint32_t lastActivityMs = 0;
+esp_sleep_wakeup_cause_t bootWakeCause = ESP_SLEEP_WAKEUP_UNDEFINED;
+esp_reset_reason_t bootResetReason = ESP_RST_UNKNOWN;
 uint8_t normalBrightness = 196;
 bool displayAutoDimmed = false;
 float currentSpeedMph = 0.0f;
@@ -699,6 +705,13 @@ void loadDeviceNickname() {
   }
   if (!devicePreferences.isKey("nickname")) return;
   const String stored = devicePreferences.getString("nickname", "");
+  // Migrate units that explicitly persisted the former factory name. Custom
+  // user nicknames remain untouched.
+  if (stored == LEGACY_BLE_DEVICE_NAME) {
+    devicePreferences.remove("nickname");
+    deviceNickname = BLE_DEVICE_NAME;
+    return;
+  }
   if (validDeviceNickname(stored)) {
     deviceNickname = stored;
   } else {
@@ -794,9 +807,54 @@ void scanSavedRides() {
   }
 }
 
+bool writeRecoveredRide(const char *path, const uint8_t *data, size_t length) {
+  File file = FFat.open(path, FILE_WRITE);
+  if (!file) return false;
+  const bool ok = file.write(data, length) == length;
+  file.close();
+  return ok;
+}
+
 bool initializeRideStorage() {
-  // Never format automatically: a mount failure should not erase saved rides.
-  return FFat.begin(false, "/ffat", 8, "ffat");
+  if (FFat.begin(false, "/ffat", 8, "ffat")) return true;
+
+  // This release carries a one-time recovery copy of the five rides extracted
+  // from the raw partition backup. Rebuild the wear-levelling metadata only
+  // once; a later unrelated mount failure must never silently erase rides.
+  Preferences recoveryState;
+  if (!recoveryState.begin("ffat_repair", false)) {
+    Serial.println("FFat repair state unavailable; refusing to format");
+    return false;
+  }
+  if (recoveryState.getBool("restored_v1", false)) {
+    Serial.println("FFat repair already attempted; refusing to format again");
+    recoveryState.end();
+    return false;
+  }
+
+  Serial.println("Rebuilding FFat wear-levelling metadata");
+  FFat.format(FFAT_WIPE_FULL);
+  const bool mounted = FFat.begin(false, "/ffat", 8, "ffat");
+  if (!mounted) {
+    Serial.println("FFat still cannot mount after full format");
+    recoveryState.end();
+    return false;
+  }
+
+  const bool restored =
+      writeRecoveredRide("/ride0.dat", recovered_ride0, recovered_ride0_len) &&
+      writeRecoveredRide("/ride1.dat", recovered_ride1, recovered_ride1_len) &&
+      writeRecoveredRide("/ride2.dat", recovered_ride2, recovered_ride2_len) &&
+      writeRecoveredRide("/ride3.dat", recovered_ride3, recovered_ride3_len) &&
+      writeRecoveredRide("/ride4.dat", recovered_ride4, recovered_ride4_len);
+  if (restored) {
+    recoveryState.putBool("restored_v1", true);
+    Serial.println("Recovered five saved rides to fresh FFat storage");
+  } else {
+    Serial.println("One or more recovered ride files could not be written");
+  }
+  recoveryState.end();
+  return restored;
 }
 
 void saveCurrentRide() {
@@ -976,15 +1034,14 @@ void textCenteredScaled(const char *text, int x, int y, uint8_t scale,
 }
 
 void textCenteredNumeric(const char *text, int x, int y, uint16_t color) {
-  canvas->setFont(&FreeSansBold24pt7b);
-  canvas->setTextSize(3);
+  canvas->setFont(&Arial_Bold92pt7b);
+  canvas->setTextSize(1);
   canvas->setTextColor(color, BLACK);
   int16_t x1, y1;
   uint16_t w, h;
   canvas->getTextBounds(text, 0, 0, &x1, &y1, &w, &h);
   canvas->setCursor(x - (x1 + int(w) / 2), y - (y1 + int(h) / 2));
   canvas->print(text);
-  canvas->setTextSize(1);
 }
 
 void textPairCentered(const char *label, const char *value, int x, int y,
@@ -1512,6 +1569,31 @@ void drawSaveRidePrompt(uint32_t now) {
   endFrame();
 }
 
+const char *wakeCauseName(esp_sleep_wakeup_cause_t cause) {
+  switch (cause) {
+    case ESP_SLEEP_WAKEUP_EXT0: return "TOUCH";
+    case ESP_SLEEP_WAKEUP_EXT1: return "EXT1";
+    case ESP_SLEEP_WAKEUP_TIMER: return "TIMER";
+    case ESP_SLEEP_WAKEUP_GPIO: return "GPIO";
+    default: return "NONE";
+  }
+}
+
+const char *resetReasonName(esp_reset_reason_t reason) {
+  switch (reason) {
+    case ESP_RST_DEEPSLEEP: return "DEEP";
+    case ESP_RST_USB: return "USB";
+    case ESP_RST_POWERON: return "POWER";
+    case ESP_RST_SW: return "SW";
+    case ESP_RST_BROWNOUT: return "BROWN";
+    case ESP_RST_PANIC: return "PANIC";
+    case ESP_RST_INT_WDT:
+    case ESP_RST_TASK_WDT:
+    case ESP_RST_WDT: return "WDT";
+    default: return "OTHER";
+  }
+}
+
 void drawStatus(uint32_t now) {
   char temperature[20];
   char line[40];
@@ -1523,18 +1605,21 @@ void drawStatus(uint32_t now) {
   if (statusPage == 0) {
     textCentered("STATUS", CENTER, uy(70), 4, WHITE);
     snprintf(line, sizeof(line), "FW  %s", FW_VERSION);
-    textCentered(line, CENTER, uy(99), 2, WHITE);
+    textCentered(line, CENTER, uy(96), 2, WHITE);
+    snprintf(line, sizeof(line), "WAKE %s / RESET %s",
+             wakeCauseName(bootWakeCause), resetReasonName(bootResetReason));
+    textCentered(line, CENTER, uy(114), 1, BABY_BLUE);
     if (batteryConnected) snprintf(battery, sizeof(battery), "%u%%", batteryPercent);
     else snprintf(battery, sizeof(battery), "N/A");
-    textPairCentered("BATTERY", battery, CENTER, uy(126), 3, WHITE,
+    textPairCentered("BATTERY", battery, CENTER, uy(137), 3, WHITE,
                      batteryConnected ? batteryColor() : RED);
     textPairCentered("BLUETOOTH", phoneConnected ? "OK" : "N/A", CENTER,
-                     uy(153), 3, WHITE, phoneConnected ? CYAN : RED);
+                     uy(162), 3, WHITE, phoneConnected ? CYAN : RED);
     const bool gpsOk = gpsAvailable(now);
-    textPairCentered("GPS", gpsOk ? "OK" : "N/A", CENTER, uy(180), 3,
+    textPairCentered("GPS", gpsOk ? "OK" : "N/A", CENTER, uy(187), 3,
                      WHITE, gpsOk ? CYAN : RED);
     snprintf(line, sizeof(line), "TEMP  %s", temperature);
-    textCentered(line, CENTER, uy(207), 3, tempC >= 65 ? RED : WHITE);
+    textCentered(line, CENTER, uy(212), 3, tempC >= 65 ? RED : WHITE);
   } else {
     textCentered("DISTANCE", CENTER, uy(70), 4, WHITE);
     snprintf(line, sizeof(line), "ODO  %.1f mi", odometerMiles + odometerPendingMiles);
@@ -1676,20 +1761,21 @@ void drawGradeRing(uint32_t now) {
 
 void drawLargeValue(const char *value, const char *label,
                     uint16_t color = WHITE) {
-  canvas->setFont(&FreeSansBold24pt7b);
-  canvas->setTextSize(3);
+  // Use a font rasterized near its final display size instead of enlarging a
+  // small bitmap. This preserves far finer curves on the 466-pixel AMOLED.
+  canvas->setFont(&Arial_Bold92pt7b);
+  canvas->setTextSize(1);
   int16_t x1 = 0, y1 = 0;
   uint16_t w = 0, h = 0;
   canvas->getTextBounds(value, 0, 0, &x1, &y1, &w, &h);
   if (w > 452 || h > 270) {
-    canvas->setTextSize(2);
+    canvas->setFont(&Arial_Bold72pt7b);
     canvas->getTextBounds(value, 0, 0, &x1, &y1, &w, &h);
   }
   canvas->setTextColor(color, BLACK);
   canvas->setCursor(CENTER - (x1 + int(w) / 2),
                     CENTER - us(10) - (y1 + int(h) / 2));
   canvas->print(value);
-  canvas->setTextSize(1);
   textCentered(label, CENTER, CENTER + us(92), 4, WHITE);
 }
 
@@ -1709,20 +1795,19 @@ void drawLiveMetric(const char *value, const char *name, const char *unit,
                     uint16_t color = WHITE) {
   textCentered(name, CENTER, uy(61), 2, 0x8410);
 
-  canvas->setFont(&FreeSansBold24pt7b);
-  canvas->setTextSize(3);
+  canvas->setFont(&Arial_Bold92pt7b);
+  canvas->setTextSize(1);
   int16_t x1 = 0, y1 = 0;
   uint16_t w = 0, h = 0;
   canvas->getTextBounds(value, 0, 0, &x1, &y1, &w, &h);
   if (w > 448 || h > 244) {
-    canvas->setTextSize(2);
+    canvas->setFont(&Arial_Bold72pt7b);
     canvas->getTextBounds(value, 0, 0, &x1, &y1, &w, &h);
   }
   canvas->setTextColor(color, BLACK);
   canvas->setCursor(CENTER - (x1 + int(w) / 2),
                     uy(122) - (y1 + int(h) / 2));
   canvas->print(value);
-  canvas->setTextSize(1);
   textCentered(unit, CENTER, uy(166), 2, color);
 }
 
@@ -2650,22 +2735,34 @@ void showBrandSplash(const char *word, uint32_t durationMs) {
 
 void showShutdownSplash() { showBrandSplash("BYO", 1000); }
 
-void prepareTouchWakePin() {
+void prepareTouchWakePin(bool resetController = false) {
   // The CST9217 IRQ is open-drain and active low. A normal GPIO pull-up is not
   // guaranteed to remain enabled when the digital domain powers down, which
   // lets the line float low and immediately wake deep sleep. Hand GPIO 11 to
   // the RTC domain and keep its pull-up active for both sleep tiers.
   detachInterrupt(digitalPinToInterrupt(TP_INT));
+  if (resetController) {
+    // Manual Off follows a touch confirmation. Resetting clears delayed CST9217
+    // contact reports that can arrive after the BYO splash and wake EXT0.
+    touch.reset();
+    delay(100);
+  }
   int16_t releaseX[2], releaseY[2];
-  uint32_t releasedSinceMs = 0;
-  while (!releasedSinceMs || millis() - releasedSinceMs < 200) {
-    if (digitalRead(TP_INT) == LOW) {
-      touch.getPoint(releaseX, releaseY, 2);
-      releasedSinceMs = 0;
-    } else if (!releasedSinceMs) {
-      releasedSinceMs = millis();
-    }
-    delay(5);
+  const uint32_t requiredQuietMs = resetController ? 1000 : 250;
+  const uint32_t releaseDeadlineMs = millis() + 5000;
+  uint32_t quietSinceMs = millis();
+  while (millis() - quietSinceMs < requiredQuietMs &&
+         int32_t(releaseDeadlineMs - millis()) > 0) {
+    noInterrupts();
+    const bool pending = touchPending;
+    touchPending = false;
+    interrupts();
+    // Read even after a short IRQ pulse has returned high. Otherwise the
+    // controller can retain that report and assert IRQ again during sleep.
+    const uint8_t points = touch.getPoint(releaseX, releaseY, 2);
+    if (pending || points || digitalRead(TP_INT) == LOW)
+      quietSinceMs = millis();
+    delay(10);
   }
   touchPending = false;
   touchActive = false;
@@ -2684,7 +2781,7 @@ void restoreTouchWakePin() {
   attachInterrupt(digitalPinToInterrupt(TP_INT), onTouchInterrupt, FALLING);
 }
 
-void enterDeepSleep() {
+void enterDeepSleep(bool manualShutdown = false) {
   saveOdometers();
   if (activeGpsFile) {
     activeGpsFile.flush();
@@ -2696,13 +2793,14 @@ void enterDeepSleep() {
 
   // Do not let the tap that selected YES satisfy the wake condition, and keep
   // the active-low IRQ pulled high after the digital GPIO domain powers down.
-  prepareTouchWakePin();
+  prepareTouchWakePin(manualShutdown);
 
-  // Shut down every software-controlled subsystem. The CST9217 stays powered
-  // because its active-low IRQ on RTC GPIO 11 is the only configured wake
-  // source. Deep-sleep wake performs a normal cold boot through setup().
-  BLEDevice::getAdvertising()->stop();
-  BLEDevice::deinit(true);
+  // The CST9217 stays powered because its active-low IRQ on RTC GPIO 11 is the
+  // only configured wake source. Do not deinitialize NimBLE here: when a phone
+  // is connected, deinit can free the server's peer map while the NimBLE host
+  // task is processing the disconnect event. Deep sleep powers the Bluetooth
+  // controller and digital domain down without requiring software teardown,
+  // and wake performs a normal cold boot through setup().
   if (pmicAvailable) {
     power.disableBattDetection();
     power.disableBattVoltageMeasure();
@@ -2713,12 +2811,14 @@ void enterDeepSleep() {
   esp_deep_sleep_start();
 }
 
-void enterLowPowerSleep() { enterDeepSleep(); }
+void enterLowPowerSleep(bool manualShutdown = false) {
+  enterDeepSleep(manualShutdown);
+}
 
 void enterInactiveSleep() {
   // During an active ride, retain RAM and the open GPS log so the same ride
-  // can continue after touch wake. The AMOLED sleeps, but BLE is left
-  // initialized so its normal disconnect/reconnect handling can recover.
+  // can continue after touch wake. NimBLE must be stopped before manual light
+  // sleep; otherwise ESP-IDF may reject sleep and return immediately.
   saveOdometers();
   if (activeGpsFile) activeGpsFile.flush();
   showShutdownSplash();
@@ -2727,6 +2827,11 @@ void enterInactiveSleep() {
 
   prepareTouchWakePin();
 
+  notifications.endForLightSleep();
+  statusCharacteristic = nullptr;
+  deviceNameCharacteristic = nullptr;
+  phoneConnected = false;
+
   if (pmicAvailable) {
     power.disableBattDetection();
     power.disableBattVoltageMeasure();
@@ -2734,9 +2839,16 @@ void enterInactiveSleep() {
   }
   esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL);
   esp_sleep_enable_ext0_wakeup(GPIO_NUM_11, 0);
-  esp_light_sleep_start();
+  const esp_err_t sleepResult = esp_light_sleep_start();
   esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_EXT0);
   restoreTouchWakePin();
+  Serial.printf("Light sleep returned: %s, wake=%d\n",
+                esp_err_to_name(sleepResult), int(esp_sleep_get_wakeup_cause()));
+
+  // Recreate the BLE server and characteristics after the light-sleep wake.
+  // The phone can reconnect while the retained ride resumes from the same
+  // distance, timer, samples, and active GPS file.
+  setupBluetooth();
 
   if (pmicAvailable) {
     power.enableBattDetection();
@@ -2816,7 +2928,7 @@ void activate(uint32_t now) {
       previousDrawMs = 0;
     }
     else if (action == ACTION_END_RIDE) prepareRideEnd(now);
-    else if (action == ACTION_POWER_OFF) enterLowPowerSleep();
+    else if (action == ACTION_POWER_OFF) enterLowPowerSleep(true);
     else if (action == ACTION_DELETE_RIDE) {
       if (pendingRideDeleteIndex >= 0) deleteSavedRide(pendingRideDeleteIndex);
       appState = RIDES_LIST;
@@ -2969,9 +3081,16 @@ void activate(uint32_t now) {
 }
 
 void setup() {
+  bootWakeCause = esp_sleep_get_wakeup_cause();
+  bootResetReason = esp_reset_reason();
   Serial.begin(115200);
+  Serial.printf("Boot wake=%s (%d), reset=%s (%d)\n",
+                wakeCauseName(bootWakeCause), int(bootWakeCause),
+                resetReasonName(bootResetReason), int(bootResetReason));
   setCpuFrequencyMhz(160);
   // Mount ride storage before the framebuffer and BLE stack reserve memory.
+  // If the known-bad wear-levelling metadata is encountered, 2.0.21 performs
+  // its guarded one-time rebuild and restores the five backed-up ride files.
   rideStorageReady = initializeRideStorage();
   if (rideStorageReady) {
     scanSavedRides();

@@ -1,6 +1,6 @@
 #pragma once
-#ifndef WAVESHARE_BIKE_ANCS_CLIENT_H
-#define WAVESHARE_BIKE_ANCS_CLIENT_H
+#ifndef PEDALONE_ANCS_CLIENT_H
+#define PEDALONE_ANCS_CLIENT_H
 
 #include <Arduino.h>
 #include <BLEDevice.h>
@@ -42,6 +42,7 @@ class AncsClient {
   using RemovedCallback = void (*)(uint32_t uid);
 
   void begin(const char *deviceName);
+  void endForLightSleep();
   void loop();
   void setStateCallback(StateCallback cb) { stateCallback_ = cb; }
   void setNotificationCallback(NotificationCallback cb) { notificationCallback_ = cb; }
@@ -143,4 +144,4 @@ class AncsClient {
   uint32_t lastGoogleLatencyMs_ = 0;
 };
 
-#endif  // WAVESHARE_BIKE_ANCS_CLIENT_H
+#endif  // PEDALONE_ANCS_CLIENT_H

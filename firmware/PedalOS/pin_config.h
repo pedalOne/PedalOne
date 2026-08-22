@@ -1,6 +1,7 @@
+#line 1 "/Users/paulpan/Documents/Arduino/PedalOne/pin_config.h"
 #pragma once
 
-// Official Waveshare ESP32-S3-Touch-AMOLED-1.75 pin map.
+// ESP32-S3-Touch-AMOLED-1.75 pin map used by PedalOne.
 #define LCD_SDIO0 4
 #define LCD_SDIO1 5
 #define LCD_SDIO2 6
