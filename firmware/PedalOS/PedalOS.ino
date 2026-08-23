@@ -71,7 +71,7 @@ constexpr uint16_t MUSHROOM_TAN = 0xDDB0;
 
 constexpr char BLE_DEVICE_NAME[] = "PedalOne";
 constexpr char LEGACY_BLE_DEVICE_NAME[] = "RAC9000";
-constexpr char FW_VERSION[] = "2.1.6";
+constexpr char FW_VERSION[] = "2.1.12";
 constexpr char BLE_SERVICE_UUID[] = "8E400001-F315-4F60-9FB8-838830DAEA50";
 constexpr char BLE_LOCATION_UUID[] = "8E400002-F315-4F60-9FB8-838830DAEA50";
 constexpr char BLE_STATUS_UUID[] = "8E400003-F315-4F60-9FB8-838830DAEA50";
@@ -586,12 +586,12 @@ String navigationStreetName(const char *instruction) {
 bool isNavigationNotification(const AncsNotification &notification) {
   String app = notification.appId;
   app.toLowerCase();
-  // Ride mode deliberately uses a strict source allowlist. ANCS Test returns
-  // above this function and continues to display every app for diagnostics.
+  // All navigation views use this strict source allowlist, including ANCS
+  // Testing, so unrelated notifications can never reach the display.
   if (app.indexOf("com.google.maps") >= 0 ||
       app.indexOf("komoot") >= 0 ||
       app.indexOf("ridewithgps") >= 0 ||
-      app.indexOf("com.byobike.bikerelay") >= 0)
+      app.indexOf("com.byobike.pedalone") >= 0)
     return true;
   return false;
 }
@@ -608,6 +608,7 @@ void onAncsStateChanged(AncsClient::State state) {
 
 void onNavigationNotification(const AncsNotification &notification) {
   ++ancsDeliveredCount;
+  if (!isNavigationNotification(notification)) return;
   if (appState == ANCS_TEST) {
     const String combined = notification.title + " " + notification.subtitle +
                             " " + notification.message;
@@ -635,7 +636,6 @@ void onNavigationNotification(const AncsNotification &notification) {
     previousDrawMs = 0;
     return;
   }
-  if (!isNavigationNotification(notification)) return;
   const String combined = notification.title + " " + notification.subtitle +
                           " " + notification.message;
   const String distance = extractDistance(combined);
@@ -681,9 +681,8 @@ void setupBluetooth() {
   notifications.setStateCallback(onAncsStateChanged);
   notifications.setNotificationCallback(onNavigationNotification);
   notifications.setRemovedCallback(onNavigationRemoved);
-  // Keep normal riding transport-filtered so unrelated notification traffic
-  // cannot consume the same BLE link used by the 5 Hz GPS relay. ANCS Test
-  // temporarily enables complete delivery while that screen is open.
+  // Keep all modes transport-filtered so unrelated notification traffic cannot
+  // consume the same BLE link used by the 5 Hz GPS relay.
   notifications.setAcceptAll(false);
   notifications.begin(deviceNickname.c_str());
   BLEService *service = notifications.server()->getServiceByUUID(BLE_SERVICE_UUID);
@@ -695,6 +694,11 @@ void setupBluetooth() {
   deviceNameCharacteristic->setCallbacks(new DeviceNameCallbacks());
   deviceNameCharacteristic->setValue(deviceNickname);
   otaUpdate.begin(notifications.server(), FW_VERSION, otaCanStart);
+  // Advertising must start only after every GATT service is registered. ANCS
+  // can auto-connect immediately after boot; advertising earlier allowed iOS
+  // to connect while the OTA service was still mutating the GATT database,
+  // leaving the GPS characteristic undiscoverable for that connection.
+  notifications.startAdvertising();
 }
 
 void loadDeviceNickname() {
@@ -2733,6 +2737,192 @@ void showBrandSplash(const char *word, uint32_t durationMs) {
   delay(durationMs);
 }
 
+constexpr uint32_t SPLASH_DOT_COMPLETE_MS = 280;
+constexpr uint32_t SPLASH_RING_COMPLETE_MS = 870;
+constexpr uint32_t SPLASH_P_COMPLETE_MS = 1250;
+constexpr uint32_t SPLASH_TEXT_COMPLETE_MS = 1510;
+constexpr uint32_t SPLASH_END_MS = 1730;
+constexpr uint16_t SPLASH_LIME = 0xB7E0;  // #B7FF00
+constexpr uint16_t SPLASH_CYAN = 0x067F;  // #00CFFF
+
+float splashProgress(uint32_t elapsed, uint32_t start, uint32_t end) {
+  if (elapsed <= start) return 0.0f;
+  if (elapsed >= end) return 1.0f;
+  const float value = float(elapsed - start) / float(end - start);
+  return value * value * (3.0f - 2.0f * value);
+}
+
+uint16_t splashGradientColor(int x, int y, float opacity = 1.0f) {
+  // Match the logo artwork: lime across the upper-left, transitioning through
+  // green to cyan down the right and along the bottom.
+  const float horizontal = constrain(float(x) / float(SCREEN_SIZE - 1), 0.0f, 1.0f);
+  const float vertical = constrain(float(y) / float(SCREEN_SIZE - 1), 0.0f, 1.0f);
+  const float amount = constrain(horizontal * 0.35f + vertical * 0.65f, 0.0f, 1.0f);
+  return scaleRgb565(blendRgb565(SPLASH_LIME, SPLASH_CYAN, amount), opacity);
+}
+
+void splashPoint(float angleDegrees, float radius, int &x, int &y) {
+  const float radians = angleDegrees * DEG_TO_RAD;
+  x = CENTER + lroundf(cosf(radians) * radius);
+  y = CENTER + lroundf(sinf(radians) * radius);
+}
+
+void drawSplashGear(float progress, float opacity) {
+  progress = constrain(progress, 0.0f, 1.0f);
+  if (progress <= 0.0f || opacity <= 0.0f) return;
+
+  // Scale the sprocket out to the round panel's usable edge. The tooth tips
+  // stop five pixels short of the 233 px display radius so antialiasing and
+  // panel-to-panel alignment do not clip the outer silhouette.
+  constexpr float innerRadius = 179.0f;
+  constexpr float rootRadius = 203.0f;
+  constexpr float toothRadius = 228.0f;
+  constexpr float segmentDegrees = 3.0f;
+  const float revealedDegrees = 360.0f * progress;
+
+  // Draw the continuous sprocket band clockwise from twelve o'clock. Short
+  // filled quadrilaterals let the color follow the diagonal artwork gradient.
+  for (float degree = 0.0f; degree < revealedDegrees; degree += segmentDegrees) {
+    const float next = fminf(degree + segmentDegrees, revealedDegrees);
+    int outer1X, outer1Y, outer2X, outer2Y;
+    int inner1X, inner1Y, inner2X, inner2Y;
+    splashPoint(-90.0f + degree, rootRadius, outer1X, outer1Y);
+    splashPoint(-90.0f + next, rootRadius, outer2X, outer2Y);
+    splashPoint(-90.0f + degree, innerRadius, inner1X, inner1Y);
+    splashPoint(-90.0f + next, innerRadius, inner2X, inner2Y);
+    const uint16_t color = splashGradientColor(
+        (outer1X + outer2X + inner1X + inner2X) / 4,
+        (outer1Y + outer2Y + inner1Y + inner2Y) / 4, opacity);
+    canvas->fillTriangle(outer1X, outer1Y, outer2X, outer2Y,
+                         inner2X, inner2Y, color);
+    canvas->fillTriangle(outer1X, outer1Y, inner2X, inner2Y,
+                         inner1X, inner1Y, color);
+  }
+
+  // Eighteen broad teeth reproduce the supplied PedalOne icon. Each tooth is
+  // revealed when the clockwise ring reaches its angular position.
+  constexpr uint8_t toothCount = 18;
+  for (uint8_t tooth = 0; tooth < toothCount; ++tooth) {
+    const float revealAt = (float(tooth) + 0.72f) / float(toothCount);
+    if (progress < revealAt) continue;
+    const float centerAngle = -90.0f + tooth * (360.0f / toothCount);
+    int root1X, root1Y, tip1X, tip1Y, tip2X, tip2Y, root2X, root2Y;
+    splashPoint(centerAngle - 7.0f, rootRadius - 1.0f, root1X, root1Y);
+    splashPoint(centerAngle - 4.7f, toothRadius, tip1X, tip1Y);
+    splashPoint(centerAngle + 4.7f, toothRadius, tip2X, tip2Y);
+    splashPoint(centerAngle + 7.0f, rootRadius - 1.0f, root2X, root2Y);
+    int colorX, colorY;
+    splashPoint(centerAngle, toothRadius - 7.0f, colorX, colorY);
+    const uint16_t color = splashGradientColor(colorX, colorY, opacity);
+    canvas->fillTriangle(root1X, root1Y, tip1X, tip1Y, tip2X, tip2Y, color);
+    canvas->fillTriangle(root1X, root1Y, tip2X, tip2Y, root2X, root2Y, color);
+  }
+}
+
+void drawSplashGradientStroke(int x1, int y1, int x2, int y2,
+                              int radius, float opacity) {
+  const float dx = float(x2 - x1);
+  const float dy = float(y2 - y1);
+  const int steps = max(1, int(sqrtf(dx * dx + dy * dy) / 2.0f));
+  for (int step = 0; step <= steps; ++step) {
+    const float amount = float(step) / float(steps);
+    const int x = lroundf(float(x1) + dx * amount);
+    const int y = lroundf(float(y1) + dy * amount);
+    canvas->fillCircle(x, y, radius, splashGradientColor(x, y, opacity));
+  }
+}
+
+void drawSplashGradientArc(int centerX, int centerY, int radius,
+                           float startDegrees, float endDegrees,
+                           int strokeRadius, float opacity) {
+  const float step = endDegrees >= startDegrees ? 2.0f : -2.0f;
+  for (float degree = startDegrees;
+       step > 0.0f ? degree <= endDegrees : degree >= endDegrees;
+       degree += step) {
+    const float radians = degree * DEG_TO_RAD;
+    const int x = centerX + lroundf(cosf(radians) * radius);
+    const int y = centerY + lroundf(sinf(radians) * radius);
+    canvas->fillCircle(x, y, strokeRadius,
+                       splashGradientColor(x, y, opacity));
+  }
+}
+
+void drawPedalOneP(float opacity) {
+  if (opacity <= 0.0f) return;
+  constexpr int strokeRadius = 14;
+
+  // The large left-facing arrow is the beginning of the P's upper stroke,
+  // matching the supplied ground-truth icon rather than a separate ornament.
+  const uint16_t arrowColor = splashGradientColor(184, 141, opacity);
+  canvas->fillTriangle(164, 141, 199, 113, 199, 169, arrowColor);
+  drawSplashGradientStroke(198, 141, 250, 141, strokeRadius, opacity);
+  drawSplashGradientArc(250, 184, 43, -90.0f, 90.0f,
+                        strokeRadius, opacity);
+  drawSplashGradientStroke(250, 227, 225, 227, strokeRadius, opacity);
+  drawSplashGradientArc(225, 259, 32, -90.0f, -180.0f,
+                        strokeRadius, opacity);
+  drawSplashGradientStroke(193, 259, 193, 276, strokeRadius, opacity);
+  const uint16_t tailColor = splashGradientColor(190, 278, opacity);
+  canvas->fillTriangle(179, 276, 207, 262, 179, 292, tailColor);
+}
+
+void drawPedalOneWordmark(float opacity) {
+  if (opacity <= 0.0f) return;
+  textCentered("PEDAL", CENTER, 318, 5, scaleRgb565(WHITE, opacity));
+  textCentered("O", CENTER - 48, 359, 4,
+               splashGradientColor(CENTER - 48, 359, opacity));
+  textCentered("N", CENTER, 359, 4,
+               splashGradientColor(CENTER, 359, opacity));
+  textCentered("E", CENTER + 48, 359, 4,
+               splashGradientColor(CENTER + 48, 359, opacity));
+}
+
+void drawPedalOneSplashFrame(uint32_t elapsed) {
+  beginFrame();
+  const float dotIn = splashProgress(elapsed, 160, SPLASH_DOT_COMPLETE_MS);
+  const float dotOut = 1.0f - splashProgress(
+      elapsed, SPLASH_RING_COMPLETE_MS, SPLASH_P_COMPLETE_MS);
+  const float dotOpacity = dotIn * dotOut;
+  if (dotOpacity > 0.0f) {
+    const int radius = 2 + lroundf(3.0f * dotIn);
+    canvas->fillCircle(CENTER, CENTER, radius,
+                       splashGradientColor(CENTER, CENTER, dotOpacity));
+  }
+
+  const float ringProgress = splashProgress(
+      elapsed, SPLASH_DOT_COMPLETE_MS, SPLASH_RING_COMPLETE_MS);
+  drawSplashGear(ringProgress, 1.0f);
+
+  const float pOpacity = splashProgress(
+      elapsed, SPLASH_RING_COMPLETE_MS, SPLASH_P_COMPLETE_MS);
+  drawPedalOneP(pOpacity);
+
+  const float textOpacity = splashProgress(
+      elapsed, SPLASH_P_COMPLETE_MS, SPLASH_TEXT_COMPLETE_MS);
+  drawPedalOneWordmark(textOpacity);
+  endAnimatedFrame();
+}
+
+void showPedalOneStartupSplash() {
+  constexpr uint32_t frameIntervalMs = 33;  // Approximately 30 FPS.
+  const uint32_t started = millis();
+  uint32_t nextFrame = started;
+  while (true) {
+    const uint32_t now = millis();
+    const uint32_t elapsed = now - started;
+    if (elapsed >= SPLASH_END_MS) break;
+    if (int32_t(now - nextFrame) < 0) {
+      delay(nextFrame - now);
+      continue;
+    }
+    drawPedalOneSplashFrame(elapsed);
+    nextFrame += frameIntervalMs;
+    if (int32_t(now - nextFrame) >= 0) nextFrame = now + 1;
+  }
+  // Guarantee the exact completed logo remains on-screen for the last frame.
+  drawPedalOneSplashFrame(SPLASH_END_MS);
+}
+
 void showShutdownSplash() { showBrandSplash("BYO", 1000); }
 
 void prepareTouchWakePin(bool resetController = false) {
@@ -2859,7 +3049,9 @@ void enterInactiveSleep() {
   display->displayOn();
   display->setBrightness(normalBrightness);
   displayAutoDimmed = false;
-  showBrandSplash("HIO", 2000);
+  // Original startup splash fallback (kept intentionally):
+  // showBrandSplash("HIO", 2000);
+  showPedalOneStartupSplash();
 
   // Resume the same ride without integrating the sleeping interval as motion
   // or backfilling it with fake minute/GPS samples. Re-baseline the phone's
@@ -2983,10 +3175,9 @@ void activate(uint32_t now) {
       portEXIT_CRITICAL(&navMux);
       ancsHistoryCount = 0;
       ancsHistoryPage = 0;
-      // The iOS test app cannot spoof Google Maps' ANCS bundle identifier or
-      // force category 10. Accept all apps only while this diagnostics screen
-      // is open so Bike Relay's Google-Maps-style test events are visible.
-      notifications.setAcceptAll(true);
+      // PedalOne's iOS test path has its own allowlisted bundle identifier, so
+      // diagnostics can remain filtered without admitting Slack or Messages.
+      notifications.setAcceptAll(false);
       appState = ANCS_TEST;
       previousDrawMs = 0;
     } else requestConfirmation(ACTION_POWER_OFF, OPTIONS_MENU);
@@ -3124,7 +3315,9 @@ void setup() {
     while (true) delay(1000);
   }
   display->setBrightness(normalBrightness);
-  showBrandSplash("HIO", 2000);
+  // Original startup splash fallback (kept intentionally):
+  // showBrandSplash("HIO", 2000);
+  showPedalOneStartupSplash();
   setenv("TZ", "PST8PDT,M3.2.0,M11.1.0", 1);
   tzset();
   loadOdometers();

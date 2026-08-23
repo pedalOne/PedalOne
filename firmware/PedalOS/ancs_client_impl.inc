@@ -85,7 +85,6 @@ void AncsClient::begin(const char *deviceName) {
           BLECharacteristic::PROPERTY_NOTIFY);
   bridgeService->start();
   ble_gap_event_listener_register(new ble_gap_event_listener(), gapEvent, this);
-  startAdvertising();
 }
 
 void AncsClient::endForLightSleep() {
@@ -631,7 +630,7 @@ bool AncsClient::isNavigationApp(const String &appId) {
   return lower.indexOf("com.google.maps") >= 0 ||
          lower.indexOf("komoot") >= 0 ||
          lower.indexOf("ridewithgps") >= 0 ||
-         lower.indexOf("com.byobike.bikerelay") >= 0;
+         lower.indexOf("com.byobike.pedalone") >= 0;
 }
 
 AncsClient::Diagnostics AncsClient::diagnostics() {

@@ -20,8 +20,8 @@ The Arduino sketch is in `firmware/PedalOS/`. The main file is named
 - a library providing `TouchDrvCST92xx.h`
 - XPowersLib
 
-The source project did not include a lockfile or record exact dependency
-versions. The following combination was compiled successfully on 2026-08-21:
+The source project does not use a lockfile. The following combination was
+compiled successfully on 2026-08-22:
 
 | Component | Version |
 | --- | --- |
@@ -40,15 +40,15 @@ versions. The following combination was compiled successfully on 2026-08-21:
    profile used for the verified build was:
 
    ```text
-   esp32:esp32:esp32s3:FlashSize=16M,PartitionScheme=app3M_fat9M_16MB,PSRAM=opi,USBMode=hwcdc
+   esp32:esp32:esp32s3:FlashSize=16M,PartitionScheme=app3M_fat9M_16MB,PSRAM=opi,USBMode=hwcdc,CDCOnBoot=cdc
    ```
 
 3. Compile and upload `firmware/PedalOS/PedalOS.ino` over USB for the first
    OTA-enabled installation.
 
-The verified compile used 896,675 bytes of application space and 62,540 bytes
-of global RAM. Hardware behavior was not tested as part of repository
-packaging; verify it on the device before publishing release binaries.
+The verified v2.1.12 compile used 932,283 bytes of application space and 62,732
+bytes of global RAM. The application image was also flashed and verified on the
+target device.
 
 ## BLE firmware update protocol
 

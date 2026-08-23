@@ -52,10 +52,10 @@ Possible errors are `BAD_COMMAND`, `BAD_BEGIN`, `BUSY`, `NOT_SAFE`,
 
 ```json
 {
-  "version": "2.1.6",
-  "url": "https://github.com/pedalOne/PedalOne/releases/download/v2.1.6/PedalOne-2.1.6.bin",
-  "size": 930240,
-  "sha256": "4ba4421cac23038ad93f9f6c035f9b5581c242b67aa91451725b134ed130470c"
+  "version": "2.1.12",
+  "url": "https://github.com/pedalOne/PedalOne/releases/download/v2.1.12/PedalOne-2.1.12.bin",
+  "size": 932528,
+  "sha256": "4507327b1070fae9ac48177bf4e70c53072b2f03ecf59a58792a63bdc0fef74e"
 }
 ```
 

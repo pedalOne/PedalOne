@@ -19,9 +19,12 @@ The code presently includes:
 - Apple Notification Center Service handling for navigation notifications;
 - application-image updates over BLE.
 
-The imported firmware still contains the legacy on-device names `RAC9000` and
-`HIO`. They have been left unchanged so this repository does not silently alter
-the device protocol or user interface while organizing the project as Pedal One.
+The current firmware is PedalOS v2.1.12. It includes the animated PedalOne
+startup identity, filtered ANCS navigation, GPS relay support, saved rides,
+odometer persistence, and BLE application-image updates.
+
+The matching OTA application image and checksum manifest are in
+[`release/v2.1.12/`](release/v2.1.12/).
 
 ## Repository layout
 
@@ -52,8 +55,7 @@ notes as a reproducible starting point.
 The public copy intentionally excludes local build caches, editor leftovers,
 cloud backup copies, machine-specific Arduino configuration, staging sketches,
 and an embedded recovery payload containing private ride/location data.
-Generated Arial bitmap headers were also excluded because their redistribution
-terms were not documented; the firmware now uses FreeSans from Adafruit GFX.
+The firmware directory includes the bitmap-font assets used by the device UI.
 
 Do not commit credentials or private ride exports. The included `.gitignore`
 covers common local secret files and embedded build artifacts.
