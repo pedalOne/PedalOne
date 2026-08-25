@@ -2,17 +2,7 @@ import SwiftUI
 
 struct ContentView: View {
     var body: some View {
-        TabView {
-            ConnectView()
-                .tabItem { Label("Connect", systemImage: "antenna.radiowaves.left.and.right") }
-
-            RideView()
-                .tabItem { Label("Ride", systemImage: "bicycle") }
-
-            ANCSTestView()
-                .tabItem { Label("ANCS Test", systemImage: "bell.badge") }
-        }
-        .tint(.teal)
+        PedalOneRootView()
     }
 }
 

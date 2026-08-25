@@ -20,8 +20,8 @@ struct PedalOneApp: App {
             }
             .task {
                 guard isShowingSplash else { return }
-                try? await Task.sleep(for: .seconds(3.6))
-                withAnimation(.easeOut(duration: 0.45)) {
+                try? await Task.sleep(for: .seconds(2.45))
+                withAnimation(.easeOut(duration: 0.35)) {
                     isShowingSplash = false
                 }
             }
@@ -31,75 +31,52 @@ struct PedalOneApp: App {
 
 private struct PedalOneSplashView: View {
     @State private var isMarkRevealed = false
-    @State private var areDetailsRevealed = false
-    @State private var isTerrainRevealed = false
+    @State private var isWordmarkRevealed = false
 
     var body: some View {
         GeometryReader { proxy in
             let width = proxy.size.width
-            let markSize = min(width * 0.56, 270)
+            let markSize = min(width * 0.62, 290)
 
-            ZStack(alignment: .bottom) {
+            ZStack {
                 Color.black.ignoresSafeArea()
 
-                PedalOneTerrainWave()
-                    .frame(height: min(proxy.size.height * 0.37, 330))
-                    .opacity(isTerrainRevealed ? 1 : 0)
-                    .offset(y: isTerrainRevealed ? 0 : 24)
-
-                VStack(spacing: 0) {
-                    Spacer(minLength: proxy.size.height * 0.16)
-
+                VStack(spacing: 18) {
                     PedalOneMark()
                         .frame(width: markSize, height: markSize)
-                        .scaleEffect(isMarkRevealed ? 1 : 0.78)
+                        .scaleEffect(isMarkRevealed ? 1 : 0.72)
+                        .rotationEffect(.degrees(isMarkRevealed ? 0 : -18))
                         .opacity(isMarkRevealed ? 1 : 0)
 
-                    PedalOneWordmark()
-                        .frame(maxWidth: min(width - 38, 430))
-                        .padding(.top, 26)
-
-                    Text("OPEN SOURCE BIKE COMPUTER")
-                        .font(.system(size: 14, weight: .medium, design: .rounded))
-                        .tracking(2.7)
-                        .foregroundStyle(Color(red: 0.72, green: 1, blue: 0))
-                        .minimumScaleFactor(0.72)
-                        .lineLimit(1)
-                        .padding(.horizontal, 20)
-                        .padding(.top, 12)
-
-                    Image(systemName: "bicycle")
-                        .font(.system(size: 40, weight: .light))
-                        .foregroundStyle(Color(red: 0.67, green: 1, blue: 0))
-                        .padding(.top, 46)
-
-                    Spacer(minLength: proxy.size.height * 0.28)
+                    VStack(spacing: 1) {
+                        Text("PEDAL")
+                            .foregroundStyle(.white)
+                        Text("ONE")
+                            .foregroundStyle(
+                                LinearGradient(
+                                    colors: [Color(red: 0.75, green: 1, blue: 0), Color(red: 0, green: 0.84, blue: 0.82)],
+                                    startPoint: .leading,
+                                    endPoint: .trailing
+                                )
+                            )
+                    }
+                    .font(.system(size: 34, weight: .semibold, design: .rounded))
+                    .tracking(8)
+                    .padding(.leading, 8)
+                    .opacity(isWordmarkRevealed ? 1 : 0)
+                    .offset(y: isWordmarkRevealed ? 0 : 12)
                 }
-                .opacity(areDetailsRevealed ? 1 : 0)
-                .offset(y: areDetailsRevealed ? 0 : 14)
-
-                // Keep the emblem visible during its first beat while the
-                // remaining brand elements fade in together.
-                VStack {
-                    Spacer(minLength: proxy.size.height * 0.16)
-                    PedalOneMark()
-                        .frame(width: markSize, height: markSize)
-                        .scaleEffect(isMarkRevealed ? 1 : 0.78)
-                        .opacity(isMarkRevealed && !areDetailsRevealed ? 1 : 0)
-                    Spacer()
-                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .padding(.bottom, proxy.size.height * 0.04)
             }
         }
         .accessibilityHidden(true)
         .onAppear {
-            withAnimation(.smooth(duration: 1.15)) {
+            withAnimation(.smooth(duration: 0.8)) {
                 isMarkRevealed = true
             }
-            withAnimation(.easeOut(duration: 0.8).delay(0.55)) {
-                areDetailsRevealed = true
-            }
-            withAnimation(.easeOut(duration: 1.15).delay(0.9)) {
-                isTerrainRevealed = true
+            withAnimation(.easeOut(duration: 0.42).delay(0.58)) {
+                isWordmarkRevealed = true
             }
         }
     }
