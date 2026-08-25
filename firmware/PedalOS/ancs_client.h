@@ -55,6 +55,9 @@ class AncsClient {
   // advertising starts. The GATT nickname characteristic is managed by the
   // application so the stored value remains the single source of truth.
   void setDeviceName(const String &deviceName);
+  // OTA uses a 15 ms interval for throughput. Normal GPS/ANCS operation uses
+  // 30 ms to reduce radio wakeups without materially affecting UI latency.
+  void setOtaMode(bool enabled);
   static AncsClient *instance_;
   void onConnected(uint16_t handle);
   void onDisconnected();
@@ -94,6 +97,7 @@ class AncsClient {
   void enqueueEvent(const PendingEvent &event);
   bool dequeueEvent(PendingEvent &event);
   void removeQueuedEvent(uint32_t uid);
+  void discardOlderLocationEvents(uint32_t receivedMs);
   void printHealth(uint32_t now);
   static bool isNavigationApp(const String &appId);
 
@@ -117,6 +121,7 @@ class AncsClient {
   uint16_t connHandle_ = 0xffff;
   uint16_t negotiatedMtu_ = 23;
   uint16_t connectionIntervalUnits_ = 0;
+  bool otaMode_ = false;
   uint16_t serviceStart_ = 0;
   uint16_t serviceEnd_ = 0;
   uint16_t notificationSource_ = 0;

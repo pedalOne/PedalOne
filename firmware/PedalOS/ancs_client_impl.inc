@@ -9,6 +9,7 @@
 
 namespace {
 constexpr uint32_t kAttributeTimeoutMs = 2500;
+constexpr uint32_t kMaximumEventAgeMs = 20000;
 constexpr uint8_t kMaxRetries = 2;
 constexpr uint8_t kFlagPreExisting = 1u << 2;
 const ble_uuid128_t kAncsService = BLE_UUID128_INIT(
@@ -152,6 +153,19 @@ void AncsClient::setDeviceName(const String &deviceName) {
   ble_svc_gap_device_name_set(deviceName_.c_str());
 }
 
+void AncsClient::setOtaMode(bool enabled) {
+  if (otaMode_ == enabled) return;
+  otaMode_ = enabled;
+  if (connHandle_ == 0xffff) return;
+  ble_gap_upd_params params = {};
+  params.itvl_min = params.itvl_max = enabled ? 12 : 24;  // 15 or 30 ms.
+  params.latency = 0;
+  params.supervision_timeout = 600;
+  const int rc = ble_gap_update_params(connHandle_, &params);
+  Serial.printf("BLE %s interval request %.0fms rc=%d\n",
+                enabled ? "OTA" : "normal", enabled ? 15.0f : 30.0f, rc);
+}
+
 void AncsClient::onConnected(uint16_t handle) {
   connHandle_ = handle;
   ready_ = false;
@@ -205,12 +219,12 @@ void AncsClient::loop() {
     Serial.printf("ANCS negotiated MTU=%u payload=%u\n", negotiatedMtu_,
                   negotiatedMtu_ >= 3 ? negotiatedMtu_ - 3 : 0);
     ble_gap_upd_params params = {};
-    params.itvl_min = 12;  // 15 ms
-    params.itvl_max = 24;  // 30 ms; iOS may choose within this range.
+    params.itvl_min = params.itvl_max = otaMode_ ? 12 : 24;
     params.latency = 0;
     params.supervision_timeout = 600;
     const int updateRc = ble_gap_update_params(connHandle_, &params);
-    Serial.printf("ANCS low-latency connection request rc=%d\n", updateRc);
+    Serial.printf("BLE initial %.0fms connection request rc=%d\n",
+                  otaMode_ ? 15.0f : 30.0f, updateRc);
     discover();
   }
 
@@ -251,19 +265,9 @@ void AncsClient::enqueueEvent(const PendingEvent &event) {
     return priority;
   };
   portENTER_CRITICAL(&stateMux_);
-  // Keep only the newest waiting Location notification. Do not invalidate an
-  // in-flight request: allowing it to finish avoids cancellation starvation,
-  // and the newest waiting instruction replaces it as soon as it completes.
-  if (event.category == 10) {
-    for (uint8_t i = 0; i < queueCount_;) {
-      if (queue_[i].category != 10) {
-        ++i;
-        continue;
-      }
-      for (uint8_t j = i + 1; j < queueCount_; ++j) queue_[j - 1] = queue_[j];
-      --queueCount_;
-    }
-  }
+  // Coalesce only modifications to the same NotificationUID. Real navigation
+  // can briefly publish several Location UIDs; discarding them all here loses
+  // the useful Google Maps turn before its app identifier is known.
   for (uint8_t i = 0; i < queueCount_; ++i) {
     if (queue_[i].uid == event.uid) {
       queue_[i] = event;
@@ -298,7 +302,12 @@ bool AncsClient::dequeueEvent(PendingEvent &event) {
   }
   uint8_t selected = 0;
   for (uint8_t i = 1; i < queueCount_; ++i) {
-    if (priorityOf(queue_[i]) > priorityOf(queue_[selected])) selected = i;
+    const uint8_t candidatePriority = priorityOf(queue_[i]);
+    const uint8_t selectedPriority = priorityOf(queue_[selected]);
+    if (candidatePriority > selectedPriority ||
+        (candidatePriority == selectedPriority &&
+         int32_t(queue_[i].receivedMs - queue_[selected].receivedMs) > 0))
+      selected = i;
   }
   event = queue_[selected];
   for (uint8_t i = selected + 1; i < queueCount_; ++i) queue_[i - 1] = queue_[i];
@@ -324,20 +333,44 @@ void AncsClient::removeQueuedEvent(uint32_t uid) {
   portEXIT_CRITICAL(&stateMux_);
 }
 
+void AncsClient::discardOlderLocationEvents(uint32_t receivedMs) {
+  portENTER_CRITICAL(&stateMux_);
+  for (uint8_t i = 0; i < queueCount_;) {
+    if (queue_[i].category != 10 ||
+        int32_t(queue_[i].receivedMs - receivedMs) > 0) {
+      ++i;
+      continue;
+    }
+    for (uint8_t j = i + 1; j < queueCount_; ++j) queue_[j - 1] = queue_[j];
+    --queueCount_;
+  }
+  portEXIT_CRITICAL(&stateMux_);
+}
+
 bool AncsClient::startRequest() {
   if (fetchStage_ == FetchAppId || !current_.uid) {
     PendingEvent next;
-    if (!dequeueEvent(next)) return false;
+    bool foundFresh = false;
+    while (dequeueEvent(next)) {
+      if (millis() - next.receivedMs < kMaximumEventAgeMs) {
+        foundFresh = true;
+        break;
+      }
+      ++filteredEventCount_;
+    }
+    if (!foundFresh) return false;
     currentEvent_ = next;
     current_ = {};
     current_.uid = next.uid;
     current_.eventFlags = next.eventFlags;
     current_.category = next.category;
     current_.categoryCount = next.categoryCount;
-    // Normal ride mode fetches only the inexpensive app identifier first, so
-    // unrelated notification traffic cannot starve the shared GPS relay link.
-    // ANCS Test deliberately fetches every notification in full.
-    fetchStage_ = acceptAll_ ? FetchDetails : FetchAppId;
+    // Location notifications are short-lived and frequently modified or
+    // replaced by map apps. Fetch their full payload in one round trip, then
+    // validate the returned app identifier before delivering it. Other
+    // categories retain the inexpensive app-ID-first filtering path.
+    fetchStage_ = (acceptAll_ || next.category == 10)
+        ? FetchDetails : FetchAppId;
     currentRemoved_ = false;
   }
   responseLength_ = 0;
@@ -521,15 +554,10 @@ void AncsClient::handleNotificationSource(const uint8_t *data, size_t length) {
     event.eventFlags = data[1];
     event.category = data[2];
     event.categoryCount = data[3];
-    // iOS can replay a large backlog after pairing/reconnecting. Those
-    // pre-existing notifications otherwise fill the attribute-request queue
-    // before current navigation updates arrive. Location (category 10) is the
-    // only backlog worth retaining; all other old events are intentionally
-    // filtered before they consume a queue slot.
-    if ((event.eventFlags & kFlagPreExisting) && event.category != 10) {
-      ++filteredEventCount_;
-      return;
-    }
+    // Retain pre-existing notifications until their app identifier is known.
+    // Google Maps is not guaranteed to classify every navigation alert as
+    // Location, especially when PedalOne reconnects during an active route.
+    // Queue priority still puts new and Location events ahead of this backlog.
     enqueueEvent(event);
   }
 }
@@ -588,8 +616,8 @@ bool AncsClient::parseAttributeResponse(const uint8_t *bytes, size_t length) {
     requestInFlight_ = false;
     responseLength_ = 0;
     responseChanged_ = false;
-    // Only the explicit ride-mode allowlist proceeds to the larger detail
-    // request. ANCS Test bypasses this filter while its screen is open.
+    // Only the explicit navigation-app allowlist proceeds to the larger
+    // detail request. The same rule applies in ride and ANCS Testing modes.
     if (acceptAll_ || isNavigationApp(appId)) {
       ++googleEventCount_;
       fetchStage_ = FetchDetails;
@@ -603,6 +631,7 @@ bool AncsClient::parseAttributeResponse(const uint8_t *bytes, size_t length) {
     return true;
   }
 
+  const bool directDetails = !current_.appId.length();
   current_.title = title;
   current_.subtitle = subtitle;
   current_.message = message;
@@ -616,7 +645,18 @@ bool AncsClient::parseAttributeResponse(const uint8_t *bytes, size_t length) {
                 static_cast<unsigned long>(latency),
                 static_cast<unsigned long>(dataChunkCount_), title.c_str(),
                 message.c_str());
-  if (!currentRemoved_ && notificationCallback_) notificationCallback_(current_);
+  const bool accepted = acceptAll_ || isNavigationApp(appId);
+  if (accepted) {
+    if (directDetails) ++googleEventCount_;
+    // Once a current, allowlisted Location event is complete, older waiting
+    // Location events are stale. Preserve only updates that arrived while this
+    // request was in flight.
+    if (current_.category == 10)
+      discardOlderLocationEvents(currentEvent_.receivedMs);
+    if (!currentRemoved_ && notificationCallback_) notificationCallback_(current_);
+  } else {
+    ++filteredEventCount_;
+  }
   finishRequest(true);
   current_ = {};
   fetchStage_ = FetchAppId;

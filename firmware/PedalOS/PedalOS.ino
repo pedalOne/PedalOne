@@ -71,7 +71,7 @@ constexpr uint16_t MUSHROOM_TAN = 0xDDB0;
 
 constexpr char BLE_DEVICE_NAME[] = "PedalOne";
 constexpr char LEGACY_BLE_DEVICE_NAME[] = "RAC9000";
-constexpr char FW_VERSION[] = "2.1.12";
+constexpr char FW_VERSION[] = "2.1.14";
 constexpr char BLE_SERVICE_UUID[] = "8E400001-F315-4F60-9FB8-838830DAEA50";
 constexpr char BLE_LOCATION_UUID[] = "8E400002-F315-4F60-9FB8-838830DAEA50";
 constexpr char BLE_STATUS_UUID[] = "8E400003-F315-4F60-9FB8-838830DAEA50";
@@ -170,6 +170,7 @@ AncsClient notifications;
 Preferences odometerPreferences;
 Preferences devicePreferences;
 OtaUpdate otaUpdate;
+bool otaLinkFast = false;
 
 AppState appState = READY;
 AppState statusReturnState = MENU;
@@ -3331,6 +3332,10 @@ void loop() {
   const uint32_t now = millis();
   notifications.loop();
   otaUpdate.loop(phoneConnected);
+  if (otaUpdate.active() != otaLinkFast) {
+    otaLinkFast = otaUpdate.active();
+    notifications.setOtaMode(otaLinkFast);
+  }
   updateBattery(now);
   if (otaUpdate.active() || otaUpdate.rebootPending()) {
     if (!previousDrawMs || now - previousDrawMs >= 250) {

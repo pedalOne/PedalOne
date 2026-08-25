@@ -5,7 +5,11 @@
 #include <esp_system.h>
 
 namespace {
-constexpr size_t PROGRESS_INTERVAL_BYTES = 64 * 1024;
+// iOS may queue at most one credit window of write commands before waiting for
+// this device acknowledgement. Keep the window small enough that the NimBLE
+// host and Update buffer cannot be overrun, while avoiding a round trip for
+// every 244-byte ATT payload.
+constexpr size_t PROGRESS_INTERVAL_BYTES = 8 * 1024;
 constexpr uint32_t REBOOT_DELAY_MS = 1200;
 }
 
@@ -41,7 +45,8 @@ void OtaUpdate::begin(BLEServer *server, const char *firmwareVersion,
   BLECharacteristic *control = service->createCharacteristic(
       CONTROL_UUID, BLECharacteristic::PROPERTY_WRITE);
   BLECharacteristic *data = service->createCharacteristic(
-      DATA_UUID, BLECharacteristic::PROPERTY_WRITE);
+      DATA_UUID, BLECharacteristic::PROPERTY_WRITE |
+                     BLECharacteristic::PROPERTY_WRITE_NR);
   statusCharacteristic_ = service->createCharacteristic(
       STATUS_UUID, BLECharacteristic::PROPERTY_READ |
                        BLECharacteristic::PROPERTY_NOTIFY);
