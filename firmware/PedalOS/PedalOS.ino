@@ -31,8 +31,14 @@
 #include "Arial_Bold72pt7b.h"
 #include "Arial_Bold92pt7b.h"
 #include "ancs_client.h"
+#include "onboard_gps.h"
 #include "ota_update.h"
 #include "pin_config.h"
+#include "gpx_navigation.h"
+#include "gpx_library.h"
+#ifndef PEDALONE_GPX_DEMO_BOOT
+#define PEDALONE_GPX_DEMO_BOOT 0
+#endif
 
 // PedalOne bike computer firmware for the ESP32-S3-Touch-AMOLED-1.75.
 // Touch: swipe left/right to rotate, tap to click. BOOT long-press replaces
@@ -41,7 +47,7 @@
 constexpr int SCREEN_SIZE = 466;
 constexpr int CENTER = SCREEN_SIZE / 2;
 constexpr float UI_SCALE = SCREEN_SIZE / 240.0f;
-constexpr int PAGE_COUNT = 7;
+constexpr int PAGE_COUNT = 3;
 constexpr int BOOT_BUTTON_PIN = 0;
 constexpr uint32_t LONG_PRESS_MS = 1500;
 constexpr int SWIPE_THRESHOLD = 40;
@@ -49,7 +55,17 @@ constexpr int SWIPE_VERTICAL_LIMIT = 140;
 constexpr uint32_t TOUCH_RELEASE_MS = 90;
 constexpr uint32_t TOUCH_POLL_MS = 15;
 constexpr uint32_t MENU_TOUCH_LOCKOUT_MS = 350;
-constexpr uint32_t AUTO_POWER_OFF_MS = 10UL * 60UL * 1000UL;
+#ifndef PEDALONE_POWER_TEST
+#define PEDALONE_POWER_TEST 0
+#endif
+constexpr uint32_t AUTO_POWER_OFF_MS = (PEDALONE_POWER_TEST ? 1UL : 5UL) * 60UL * 1000UL;
+constexpr uint32_t HARD_POWER_OFF_MS = (PEDALONE_POWER_TEST ? 5UL : 120UL) * 60UL * 1000UL;
+// The ten-minute inactive transition already happened when either sleep tier
+// starts, so this timer covers only the remaining time to true power-off.
+constexpr uint64_t HARD_POWER_OFF_REMAINING_US =
+    uint64_t(HARD_POWER_OFF_MS - AUTO_POWER_OFF_MS) * 1000ULL;
+constexpr uint64_t HARD_POWER_OFF_MANUAL_US =
+    uint64_t(HARD_POWER_OFF_MS) * 1000ULL;
 
 constexpr uint16_t BLACK = RGB565_BLACK;
 constexpr uint16_t WHITE = RGB565_WHITE;
@@ -71,7 +87,7 @@ constexpr uint16_t MUSHROOM_TAN = 0xDDB0;
 
 constexpr char BLE_DEVICE_NAME[] = "PedalOne";
 constexpr char LEGACY_BLE_DEVICE_NAME[] = "RAC9000";
-constexpr char FW_VERSION[] = "2.1.14";
+constexpr char FW_VERSION[] = "2.1.31";
 constexpr char BLE_SERVICE_UUID[] = "8E400001-F315-4F60-9FB8-838830DAEA50";
 constexpr char BLE_LOCATION_UUID[] = "8E400002-F315-4F60-9FB8-838830DAEA50";
 constexpr char BLE_STATUS_UUID[] = "8E400003-F315-4F60-9FB8-838830DAEA50";
@@ -144,7 +160,7 @@ static_assert(sizeof(LocationPacket) == 28, "Location packet v2 must be 28 bytes
 
 enum AppState { READY, MENU, OPTIONS_MENU, RIDES_LIST, ANCS_TEST, RIDE_MENU, STATUS_PAGE,
                 DISPLAY_PAGE, COUNTDOWN, RIDING, SUMMARY, CONFIRM_PAGE,
-                SAVE_RIDE_PROMPT };
+                SAVE_RIDE_PROMPT, GPX_DEMO, ROUTES_LIST, START_ROUTE_MENU, BLUETOOTH_PAGE };
 enum Gesture { GESTURE_NONE, GESTURE_TAP, GESTURE_LEFT, GESTURE_RIGHT,
                GESTURE_UP };
 enum PendingAction { ACTION_NONE, ACTION_END_RIDE, ACTION_POWER_OFF,
@@ -177,6 +193,10 @@ AppState statusReturnState = MENU;
 AppState displayReturnState = RIDE_MENU;
 AppState confirmReturnState = MENU;
 PendingAction pendingAction = ACTION_NONE;
+gpx::Simulation gpxSimulation;
+GpxLibrary gpxLibrary;
+int selectedRouteRow=0;
+bool routeSelectionForStart=false, routeNavigationEnabled=false;
 int currentPage = 0;
 int menuSelection = 0;
 uint32_t previousDrawMs = 0;
@@ -185,6 +205,8 @@ bool hasFramebufferHash = false;
 uint32_t countdownStartMs = 0;
 uint32_t rideStartMs = 0;
 uint32_t ridePreviousMs = 0;
+uint32_t ridePausedAtMs = 0;
+bool ridePaused = false;
 uint32_t stationarySinceMs = 0;
 uint32_t zeroSpeedSinceMs = 0;
 uint32_t lastActivityMs = 0;
@@ -246,6 +268,14 @@ LocationPacket latestLocation = {};
 portMUX_TYPE locationMux = portMUX_INITIALIZER_UNLOCKED;
 volatile bool hasLocation = false;
 volatile uint32_t lastLocationMs = 0;
+OnboardGps onboardGps;
+bool onboardGpsPresent = false;
+uint16_t lastOnboardGpsSequence = 0;
+bool bleBarometerAvailable = false;
+uint32_t lastBleBarometerMs = 0;
+int32_t latestBleBarometerCm = 0;
+uint32_t latestBleTimestamp = 0;
+uint32_t lastBleTimestampMs = 0;
 bool phoneConnected = false;
 portMUX_TYPE navMux = portMUX_INITIALIZER_UNLOCKED;
 bool navVisible = false;
@@ -276,6 +306,7 @@ bool batteryConnected = false;
 bool batteryCharging = false;
 uint8_t batteryPercent = 0;
 uint32_t lastBatteryReadMs = 0;
+bool bluetoothEnabled=true;
 BLECharacteristic *statusCharacteristic = nullptr;
 BLECharacteristic *deviceNameCharacteristic = nullptr;
 String deviceNickname = BLE_DEVICE_NAME;
@@ -308,6 +339,7 @@ int8_t pendingRideDeleteIndex = -1;
 
 volatile bool touchPending = false;
 bool touchActive = false;
+bool touchCancelConsumed = false;
 bool touchAdjustedBrightness = false;
 int16_t touchStartX = 0, touchStartY = 0, touchLastX = 0, touchLastY = 0;
 uint32_t touchStartMs = 0, touchLastMs = 0;
@@ -343,10 +375,25 @@ class LocationCallbacks : public BLECharacteristicCallbacks {
     if ((packet.version == 1 && value.length() != LOCATION_PACKET_V1_SIZE) ||
         (packet.version == 2 && value.length() != sizeof(LocationPacket)) ||
         (packet.version != 1 && packet.version != 2)) return;
+    const uint32_t receivedMs = millis();
     portENTER_CRITICAL(&locationMux);
-    latestLocation = packet;
-    lastLocationMs = millis();
-    hasLocation = true;
+    if (onboardGpsPresent) {
+      // Keep the phone's barometer as an elevation aid, but do not let phone
+      // coordinates or speed replace a detected onboard receiver.
+      if (packet.timestamp) {
+        latestBleTimestamp = packet.timestamp;
+        lastBleTimestampMs = receivedMs;
+      }
+      if (packet.version >= 2 && (packet.flags & (1 << 3))) {
+        latestBleBarometerCm = packet.barometricRelativeAltitudeCm;
+        lastBleBarometerMs = receivedMs;
+        bleBarometerAvailable = true;
+      }
+    } else {
+      latestLocation = packet;
+      lastLocationMs = receivedMs;
+      hasLocation = true;
+    }
     portEXIT_CRITICAL(&locationMux);
   }
 };
@@ -694,12 +741,14 @@ void setupBluetooth() {
   deviceNameCharacteristic = service->getCharacteristic(BLE_DEVICE_NAME_UUID);
   deviceNameCharacteristic->setCallbacks(new DeviceNameCallbacks());
   deviceNameCharacteristic->setValue(deviceNickname);
+  gpxLibrary.begin(service->getCharacteristic(GPX_BLE_UUID), rideStorageReady);
   otaUpdate.begin(notifications.server(), FW_VERSION, otaCanStart);
   // Advertising must start only after every GATT service is registered. ANCS
   // can auto-connect immediately after boot; advertising earlier allowed iOS
   // to connect while the OTA service was still mutating the GATT database,
   // leaving the GPS characteristic undiscoverable for that connection.
-  notifications.startAdvertising();
+  if (bluetoothEnabled) notifications.startAdvertising();
+  else notifications.setEnabled(false);
 }
 
 void loadDeviceNickname() {
@@ -978,7 +1027,7 @@ void formatRideName(const SavedRideMeta &ride, char *text, size_t size) {
 void textCenteredRide(const char *text, int x, int y, uint16_t color) {
   canvas->setFont(&FreeSansBold18pt7b);
   canvas->setTextSize(1);
-  canvas->setTextColor(color, BLACK);
+  canvas->setTextColor(color);
   int16_t x1, y1;
   uint16_t w, h;
   canvas->getTextBounds(text, 0, 0, &x1, &y1, &w, &h);
@@ -1003,7 +1052,7 @@ void textCentered(const char *text, int x, int y, uint8_t size,
   else if (size >= 5) font = &FreeSansBold24pt7b;
   canvas->setFont(font);
   canvas->setTextSize(1);
-  canvas->setTextColor(color, BLACK);
+  canvas->setTextColor(color);
   int16_t x1, y1;
   uint16_t w, h;
   canvas->getTextBounds(text, 0, 0, &x1, &y1, &w, &h);
@@ -1017,7 +1066,7 @@ void textLeft(const char *text, int x, int y, uint8_t size, uint16_t color) {
                         (size == 2 ? &FreeSans12pt7b : &FreeSans9pt7b);
   canvas->setFont(font);
   canvas->setTextSize(1);
-  canvas->setTextColor(color, BLACK);
+  canvas->setTextColor(color);
   int16_t x1, y1;
   uint16_t w, h;
   canvas->getTextBounds(text, 0, 0, &x1, &y1, &w, &h);
@@ -1029,7 +1078,7 @@ void textCenteredScaled(const char *text, int x, int y, uint8_t scale,
                         uint16_t color) {
   canvas->setFont(&FreeSansBold24pt7b);
   canvas->setTextSize(scale);
-  canvas->setTextColor(color, BLACK);
+  canvas->setTextColor(color);
   int16_t x1, y1;
   uint16_t w, h;
   canvas->getTextBounds(text, 0, 0, &x1, &y1, &w, &h);
@@ -1041,7 +1090,7 @@ void textCenteredScaled(const char *text, int x, int y, uint8_t scale,
 void textCenteredNumeric(const char *text, int x, int y, uint16_t color) {
   canvas->setFont(&Arial_Bold92pt7b);
   canvas->setTextSize(1);
-  canvas->setTextColor(color, BLACK);
+  canvas->setTextColor(color);
   int16_t x1, y1;
   uint16_t w, h;
   canvas->getTextBounds(text, 0, 0, &x1, &y1, &w, &h);
@@ -1064,10 +1113,10 @@ void textPairCentered(const char *label, const char *value, int x, int y,
   const int start = x - (int(lw) + gap + int(vw)) / 2;
   const int height = max(int(lh), int(vh));
   const int baseline = y - (min(ly, vy) + height / 2);
-  canvas->setTextColor(labelColor, BLACK);
+  canvas->setTextColor(labelColor);
   canvas->setCursor(start - lx, baseline);
   canvas->print(label);
-  canvas->setTextColor(valueColor, BLACK);
+  canvas->setTextColor(valueColor);
   canvas->setCursor(start + lw + gap - vx, baseline);
   canvas->print(value);
 }
@@ -1090,8 +1139,38 @@ bool gpsAvailable(uint32_t now) {
   return available && timestampIsFresh(now, receivedMs, GPS_STATUS_TIMEOUT_MS);
 }
 
-void drawBluetoothIcon(int x, int y, bool connected) {
-  const uint16_t c = connected ? BLE_CONNECTED_BLUE : RED;
+void publishOnboardGpsFix(uint32_t now) {
+  OnboardGpsFix fix;
+  if (!onboardGps.takeFix(lastOnboardGpsSequence, fix)) return;
+
+  LocationPacket packet = {};
+  packet.version = 1;
+  packet.sequence = fix.sequence;
+  packet.timestamp = fix.timestamp;
+  packet.latitudeE7 = fix.latitudeE7;
+  packet.longitudeE7 = fix.longitudeE7;
+  packet.altitudeDm = fix.altitudeDm;
+  packet.speedCms = fix.speedCms;
+  packet.courseDeg100 = fix.courseDeg100;
+  packet.accuracyCm = fix.accuracyCm;
+  packet.flags = fix.flags;
+
+  portENTER_CRITICAL(&locationMux);
+  if (bleBarometerAvailable &&
+      timestampIsFresh(now, lastBleBarometerMs, LOCATION_TIMEOUT_MS)) {
+    packet.version = 2;
+    packet.flags |= 1 << 3;
+    packet.barometricRelativeAltitudeCm = latestBleBarometerCm;
+  }
+  latestLocation = packet;
+  lastLocationMs = now;
+  hasLocation = true;
+  portEXIT_CRITICAL(&locationMux);
+}
+
+void drawBluetoothIcon(int x, int y, bool enabled, bool connected) {
+  const uint16_t c = !enabled ? 0x8410 :
+      (connected ? BLE_CONNECTED_BLUE : RED);
   const auto is = [](float v) { return us(v * 0.52f); };
   const int radius = max(1, is(1.6f));
   const auto thickLine = [radius, c](int x1, int y1, int x2, int y2) {
@@ -1173,6 +1252,12 @@ void drawHeader(uint32_t now) {
   packet = latestLocation;
   timeAvailable = hasLocation && packet.timestamp > 0;
   receivedMs = lastLocationMs;
+  if (!timeAvailable && onboardGpsPresent && latestBleTimestamp &&
+      timestampIsFresh(now, lastBleTimestampMs, GPS_STATUS_TIMEOUT_MS)) {
+    packet.timestamp = latestBleTimestamp;
+    receivedMs = lastBleTimestampMs;
+    timeAvailable = true;
+  }
   portEXIT_CRITICAL(&locationMux);
   if (timeAvailable) {
     time_t phoneTime = packet.timestamp + nonNegativeElapsedMs(now, receivedMs) / 1000;
@@ -1186,7 +1271,7 @@ void drawHeader(uint32_t now) {
   // Follow the round display edge while preserving a small pixel keepout.
   // Keep a clear status icon on either side and tuck the battery directly
   // below the clock without overlapping its glyph bounds.
-  drawBluetoothIcon(ux(68), uy(20), phoneConnected);
+  drawBluetoothIcon(ux(68), uy(20), bluetoothEnabled, phoneConnected);
   drawNavigationIcon(ux(172), uy(20), gpsAvailable(now));
   textCentered(text, CENTER, uy(20), 3, WHITE);
   drawBatteryIcon(CENTER, uy(35));
@@ -1321,7 +1406,7 @@ void drawWrappedNavigationText(const char *text, int y, int maxLines,
                         (size >= 4 ? &FreeSansBold18pt7b : &FreeSans18pt7b);
   canvas->setFont(font);
   canvas->setTextSize(1);
-  canvas->setTextColor(WHITE, BLACK);
+  canvas->setTextColor(WHITE);
   String remaining(text);
   for (int line = 0; line < maxLines && remaining.length(); ++line) {
     int take = remaining.length();
@@ -1418,11 +1503,50 @@ void endAnimatedFrame() {
   hasFramebufferHash = false;
 }
 
+uint16_t interpolateRgb565(uint16_t top, uint16_t bottom, float amount) {
+  amount = constrain(amount, 0.0f, 1.0f);
+  const float inverse = 1.0f - amount;
+  const uint16_t red = uint16_t(((top >> 11) & 0x1f) * inverse +
+                                ((bottom >> 11) & 0x1f) * amount + 0.5f);
+  const uint16_t green = uint16_t(((top >> 5) & 0x3f) * inverse +
+                                  ((bottom >> 5) & 0x3f) * amount + 0.5f);
+  const uint16_t blue = uint16_t((top & 0x1f) * inverse +
+                                 (bottom & 0x1f) * amount + 0.5f);
+  return (red << 11) | (green << 5) | blue;
+}
+
+void fillVerticalGradientRoundRect(int x, int y, int width, int height,
+                                   int radius, uint16_t top,
+                                   uint16_t bottom) {
+  for (int row = 0; row < height; ++row) {
+    int inset = 0;
+    if (row < radius) {
+      const int dy = radius - row;
+      inset = radius - int(sqrtf(float(radius * radius - dy * dy)));
+    } else if (row >= height - radius) {
+      const int dy = row - (height - radius - 1);
+      inset = radius - int(sqrtf(float(max(0, radius * radius - dy * dy))));
+    }
+    const uint16_t color = interpolateRgb565(
+        top, bottom, height > 1 ? float(row) / float(height - 1) : 0.0f);
+    canvas->drawFastHLine(x + inset, y + row,
+                          max(1, width - inset * 2), color);
+  }
+}
+
 void drawReadyScreen(uint32_t now) {
   beginFrame();
   drawHeader(now);
-  textCenteredScaled("Let's", CENTER, uy(88), 2, WHITE);
-  textCenteredScaled("Go!", CENTER, uy(151), 2, WHITE);
+  if (onboardGpsPresent) {
+    const bool acquired = onboardGps.fixFresh(now);
+    textCentered(acquired ? "GPS Acquired" : "Acquiring GPS...",
+                 CENTER, uy(55), 2, acquired ? GREEN : YELLOW);
+    textCenteredScaled("Let's", CENTER, uy(105), 2, WHITE);
+    textCenteredScaled("Go!", CENTER, uy(163), 2, WHITE);
+  } else {
+    textCenteredScaled("Let's", CENTER, uy(88), 2, WHITE);
+    textCenteredScaled("Go!", CENTER, uy(151), 2, WHITE);
+  }
   const float phase = (now % 1000) / 1000.0f;
   const float bounce = 4.0f * phase * (1.0f - phase);
   canvas->fillCircle(CENTER, uy(224 - int(bounce * 25)), us(7), CYAN);
@@ -1430,8 +1554,7 @@ void drawReadyScreen(uint32_t now) {
 }
 
 void drawMenu(uint32_t now) {
-  static const char *optionItems[] = {"STATUS", "BRIGHTNESS", "ODOMETER", "RIDES", "ANCS TESTING", "OFF"};
-  static const char *rideItems[] = {"BACK", "STATUS", "BRIGHTNESS", "END"};
+  static const char *optionItems[] = {"Status", "Bluetooth", "Brightness", "Odometer", "Rides", "Routes", "OFF"};
   const bool ride = appState == RIDE_MENU;
   beginFrame();
   drawHeader(now);
@@ -1447,13 +1570,50 @@ void drawMenu(uint32_t now) {
     endFrame();
     return;
   }
-  const char **items = ride ? rideItems : optionItems;
-  const int count = ride ? 4 : 6;
+  if (ride) {
+    textCentered("MENU", CENTER, uy(62), 5, WHITE);
+    canvas->drawFastHLine(ux(48), uy(79), ux(144), 0x4208);
+    textCentered("Info", ux(70), uy(101), 4, WHITE);
+    textCentered("Display", ux(170), uy(101), 4, WHITE);
+    textCenteredScaled("i", ux(70), uy(143), 2, WHITE);
+    canvas->fillCircle(ux(170),uy(140),us(14),WHITE);
+    for(int ray=0;ray<8;++ray) {
+      const float angle=ray*PI/4;
+      wideLine(ux(170)+lroundf(cosf(angle)*us(20)),uy(140)+lroundf(sinf(angle)*us(20)),
+               ux(170)+lroundf(cosf(angle)*us(26)),uy(140)+lroundf(sinf(angle)*us(26)),us(2),WHITE);
+    }
+
+    // Broad filled controls sit against the round lower edge. Their large
+    // hit regions make the critical ride controls easy to use with gloves.
+    const uint16_t pauseTop = ridePaused ? GREEN : YELLOW;
+    const uint16_t pauseBottom = ridePaused
+        ? interpolateRgb565(GREEN, BLACK, 0.38f) : ORANGE;
+    fillVerticalGradientRoundRect(ux(18), uy(178), us(99), us(55), us(12),
+                                  pauseTop, pauseBottom);
+    fillVerticalGradientRoundRect(ux(123), uy(178), us(99), us(55), us(12),
+                                  interpolateRgb565(RED, WHITE, 0.20f),
+                                  interpolateRgb565(RED, BLACK, 0.32f));
+    if (ridePaused) {
+      canvas->fillTriangle(ux(58), uy(191), ux(58), uy(221),
+                           ux(81), uy(206), WHITE);
+    } else {
+      canvas->fillRoundRect(ux(56), uy(192), us(8), us(28), us(2), WHITE);
+      canvas->fillRoundRect(ux(72), uy(192), us(8), us(28), us(2), WHITE);
+    }
+    canvas->fillRoundRect(ux(159), uy(193), us(27), us(27), us(3), WHITE);
+    endFrame();
+    return;
+  }
+  const char **items = optionItems;
+  const int count = 7;
   for (int i = 0; i < count; ++i) {
     const bool selected = i == menuSelection;
-    const int y = ride ? 61 + i * 47 : 50 + i * 31;
-    textCentered(items[i], CENTER, uy(y),
-                 ride ? (selected ? 5 : 4) : (selected ? 4 : 3), WHITE);
+    const int y = 49 + i * 26;
+    if(i==6) {
+      for(int inset=0;inset<us(2);++inset)
+        canvas->drawRect(ux(85)+inset,uy(y-13)+inset,us(70)-2*inset,us(27)-2*inset,RED);
+    }
+    textCentered(items[i], CENTER, uy(y), selected ? 4 : 3, WHITE);
   }
   endFrame();
 }
@@ -1600,32 +1760,34 @@ const char *resetReasonName(esp_reset_reason_t reason) {
 }
 
 void drawStatus(uint32_t now) {
-  char temperature[20];
   char line[40];
-  char battery[12];
-  const float tempC = temperatureRead();
-  snprintf(temperature, sizeof(temperature), "%.1f C", tempC);
   beginFrame();
-  drawHeader(now);
   if (statusPage == 0) {
-    textCentered("STATUS", CENTER, uy(70), 4, WHITE);
-    snprintf(line, sizeof(line), "FW  %s", FW_VERSION);
-    textCentered(line, CENTER, uy(96), 2, WHITE);
-    snprintf(line, sizeof(line), "WAKE %s / RESET %s",
-             wakeCauseName(bootWakeCause), resetReasonName(bootResetReason));
-    textCentered(line, CENTER, uy(114), 1, BABY_BLUE);
-    if (batteryConnected) snprintf(battery, sizeof(battery), "%u%%", batteryPercent);
-    else snprintf(battery, sizeof(battery), "N/A");
-    textPairCentered("BATTERY", battery, CENTER, uy(137), 3, WHITE,
-                     batteryConnected ? batteryColor() : RED);
-    textPairCentered("BLUETOOTH", phoneConnected ? "OK" : "N/A", CENTER,
-                     uy(162), 3, WHITE, phoneConnected ? CYAN : RED);
-    const bool gpsOk = gpsAvailable(now);
-    textPairCentered("GPS", gpsOk ? "OK" : "N/A", CENTER, uy(187), 3,
-                     WHITE, gpsOk ? CYAN : RED);
-    snprintf(line, sizeof(line), "TEMP  %s", temperature);
-    textCentered(line, CENTER, uy(212), 3, tempC >= 65 ? RED : WHITE);
+    textCentered("STATUS", CENTER, uy(50), 4, WHITE);
+
+    snprintf(line, sizeof(line), "FW: %s", FW_VERSION);
+    textCentered(line, CENTER, uy(84), 3, WHITE);
+
+    if (batteryConnected)
+      snprintf(line, sizeof(line), "Battery: %d%%", batteryPercent);
+    else
+      snprintf(line, sizeof(line), "Battery: N/A");
+    textCentered(line, CENTER, uy(116), 3, WHITE);
+
+    if (onboardGpsPresent)
+      snprintf(line, sizeof(line), "GPS: Local (%u)",
+               unsigned(onboardGps.satellites()));
+    else
+      snprintf(line, sizeof(line), "GPS: %s",
+               gpsAvailable(now) ? "OK" : "N/A");
+    textCentered(line, CENTER, uy(148), 3, WHITE);
+
+    snprintf(line, sizeof(line), "Bluetooth: %s",
+             !bluetoothEnabled ? "Off" :
+             (phoneConnected ? "Connected" : "Disconnected"));
+    textCentered(line, CENTER, uy(180), 3, WHITE);
   } else {
+    drawHeader(now);
     textCentered("DISTANCE", CENTER, uy(70), 4, WHITE);
     snprintf(line, sizeof(line), "ODO  %.1f mi", odometerMiles + odometerPendingMiles);
     textCentered(line, CENTER, uy(108), 3, WHITE);
@@ -1677,6 +1839,16 @@ void drawConfirmation(uint32_t now) {
   endFrame();
 }
 
+void drawBluetoothPage(uint32_t now) {
+  beginFrame();drawHeader(now);
+  textCentered("Bluetooth",CENTER,uy(80),4,WHITE);
+  canvas->fillRoundRect(ux(55),uy(112),us(130),us(46),us(23),bluetoothEnabled ? GREEN : 0x4208);
+  canvas->fillCircle(ux(bluetoothEnabled ? 163 : 77),uy(135),us(18),WHITE);
+  textCentered("OFF",ux(29),uy(135),2,WHITE);
+  textCentered("ON",ux(211),uy(135),2,WHITE);
+  endFrame();
+}
+
 void drawDisplayPage(uint32_t now) {
   char percentage[12];
   snprintf(percentage, sizeof(percentage), "%d%%",
@@ -1694,7 +1866,7 @@ void drawDisplayPage(uint32_t now) {
 
 void drawCountdown(uint32_t now) {
   const uint32_t elapsed = now - countdownStartMs;
-  const int number = 3 - elapsed / 1000;
+  const int number = max(1, 3 - int(elapsed / 1000));
   const float progress = (elapsed % 1000) / 1000.0f;
   beginFrame();
   canvas->drawArc(CENTER, CENTER, us(119), us(110), 0,
@@ -1704,6 +1876,7 @@ void drawCountdown(uint32_t now) {
   char text[4];
   snprintf(text, sizeof(text), "%d", number);
   textCenteredNumeric(text, CENTER, uy(165), START_GREEN);
+  textCentered("Hold 2 sec to cancel", CENTER, uy(215), 2, WHITE);
   endAnimatedFrame();
 }
 
@@ -1777,7 +1950,7 @@ void drawLargeValue(const char *value, const char *label,
     canvas->setFont(&Arial_Bold72pt7b);
     canvas->getTextBounds(value, 0, 0, &x1, &y1, &w, &h);
   }
-  canvas->setTextColor(color, BLACK);
+  canvas->setTextColor(color);
   canvas->setCursor(CENTER - (x1 + int(w) / 2),
                     CENTER - us(10) - (y1 + int(h) / 2));
   canvas->print(value);
@@ -1809,7 +1982,7 @@ void drawLiveMetric(const char *value, const char *name, const char *unit,
     canvas->setFont(&Arial_Bold72pt7b);
     canvas->getTextBounds(value, 0, 0, &x1, &y1, &w, &h);
   }
-  canvas->setTextColor(color, BLACK);
+  canvas->setTextColor(color);
   canvas->setCursor(CENTER - (x1 + int(w) / 2),
                     uy(122) - (y1 + int(h) / 2));
   canvas->print(value);
@@ -1878,7 +2051,7 @@ void drawThreeMetricRidePage(uint32_t seconds) {
 
   char distanceText[16];
   char timeText[16];
-  snprintf(distanceText, sizeof(distanceText), "%.1f", distanceMiles);
+  snprintf(distanceText, sizeof(distanceText), distanceMiles<9.995f ? "%.2f" : "%.1f", distanceMiles);
   snprintf(timeText, sizeof(timeText), "%02lu:%02lu:%02lu",
            (unsigned long)(seconds / 3600),
            (unsigned long)((seconds / 60) % 60),
@@ -1958,14 +2131,25 @@ void drawAnimatedSpeedArcPage(uint32_t now, uint32_t seconds) {
   char speedText[12];
   char distanceText[16];
   char timeText[16];
-  snprintf(speedText, sizeof(speedText), "%d", int(roundf(currentSpeedMph)));
-  snprintf(distanceText, sizeof(distanceText), "%.1f", distanceMiles);
-  snprintf(timeText, sizeof(timeText), "%02lu:%02lu:%02lu",
-           (unsigned long)(seconds / 3600),
-           (unsigned long)((seconds / 60) % 60),
-           (unsigned long)(seconds % 60));
+  const float displaySpeed=max(0.0f,currentSpeedMph);
+  snprintf(speedText, sizeof(speedText), "%d", int(roundf(displaySpeed)));
+  snprintf(distanceText, sizeof(distanceText), distanceMiles<9.995f ? "%.2f" : "%.1f", distanceMiles);
+  if(seconds<3600) {
+    snprintf(timeText,sizeof(timeText),"%02lu:%02lu",
+             (unsigned long)(seconds/60),(unsigned long)(seconds%60));
+  } else {
+    snprintf(timeText,sizeof(timeText),"%02lu:%02lu:%02lu",
+             (unsigned long)(seconds/3600),(unsigned long)((seconds/60)%60),
+             (unsigned long)(seconds%60));
+  }
 
-  textCenteredNumeric(speedText, CENTER, uy(121), WHITE);
+  canvas->setFont(&Arial_Bold72pt7b);
+  canvas->setTextSize(1);
+  canvas->setTextColor(WHITE);
+  int16_t speedX,speedY;uint16_t speedW,speedH;
+  canvas->getTextBounds(speedText,0,0,&speedX,&speedY,&speedW,&speedH);
+  canvas->setCursor(CENTER-(speedX+int(speedW)/2),uy(121)-(speedY+int(speedH)/2));
+  canvas->print(speedText);
   textCentered("MPH", CENTER, uy(165), 2, WHITE);
   textCentered("0", ux(30), uy(173), 1, WHITE);
   textCentered("25", ux(210), uy(173), 1, WHITE);
@@ -1978,75 +2162,40 @@ void drawAnimatedSpeedArcPage(uint32_t now, uint32_t seconds) {
   textCentered(timeText, ux(160), uy(210), 3, WHITE);
 }
 
+void drawPausedBadge() {
+  if (!ridePaused) return;
+  canvas->fillRoundRect(ux(73), uy(49), us(94), us(23), us(6), BLACK);
+  canvas->drawRoundRect(ux(73), uy(49), us(94), us(23), us(6), YELLOW);
+  textCentered("PAUSED", CENTER, uy(61), 2, YELLOW);
+}
+
+#include "gpx_display.inc"
+
 void drawRidePage(uint32_t now) {
-  char value[24];
-  char leftValue[20];
-  char middleValue[20];
-  char rightValue[20];
-  const uint32_t seconds = (now - rideStartMs) / 1000;
+  if (currentPage == gpx::PAGE_INDEX) { drawLiveGpxPage(now); return; }
+  const uint32_t seconds = activeRideElapsedMs(now) / 1000;
   beginFrame();
   drawGradeRing(now);
   drawHeader(now);
-  if (currentPage == PAGE_COUNT - 2) {
-    drawThreeMetricRidePage(seconds);
-    drawRidePageDots();
-    endAnimatedFrame();
-    return;
-  }
-
-  if (currentPage == PAGE_COUNT - 1) {
+  if (currentPage == 0) {
     drawAnimatedSpeedArcPage(now, seconds);
-    drawRidePageDots();
-    endAnimatedFrame();
-    return;
+  } else {
+    // Three large, vertically spaced values fit inside the round display.
+    char value[24];
+    textCentered("DISTANCE", CENTER, uy(65), 2, 0xAD55);
+    snprintf(value, sizeof(value), distanceMiles<9.995f ? "%.2f MI" : "%.1f MI", distanceMiles);
+    textCentered(value, CENTER, uy(87), 5, WHITE);
+    canvas->drawFastHLine(ux(53), uy(106), us(134), 0x4208);
+    textCentered("AVG SPEED", CENTER, uy(122), 2, 0xAD55);
+    snprintf(value, sizeof(value), "%.1f MPH", averageSpeedMph);
+    textCentered(value, CENTER, uy(144), 5, WHITE);
+    canvas->drawFastHLine(ux(53), uy(163), us(134), 0x4208);
+    textCentered("CLIMB", CENTER, uy(180), 2, 0xAD55);
+    snprintf(value, sizeof(value), "%.0f FT", climbFeet);
+    textCentered(value, CENTER, uy(203), 5, WHITE);
   }
-  switch (currentPage) {
-    case 0:
-      drawLiveSpeedMetric(currentSpeedMph);
-      break;
-    case 1:
-      if (liveGradeValid && now - lastGradeSampleMs <= 5000) {
-        snprintf(value, sizeof(value), "%+.1f", liveGradePercent);
-        drawLiveMetric(value, "CURRENT GRADE", "%", gradeColor(liveGradePercent));
-      } else {
-        drawLiveMetric("--", "CURRENT GRADE", "%", 0x8410);
-      }
-      break;
-    case 2:
-      snprintf(value, sizeof(value), "%.1f", distanceMiles);
-      drawLiveMetric(value, "DISTANCE", "MILES");
-      break;
-    case 3:
-      snprintf(value, sizeof(value), "%.1f", averageSpeedMph);
-      drawLiveMetric(value, "AVERAGE SPEED", "MPH");
-      break;
-    case 4:
-      snprintf(value, sizeof(value), "%d", int(roundf(climbFeet)));
-      drawLiveMetric(value, "TOTAL CLIMB", "FT");
-      break;
-    default:
-      break;
-  }
-  canvas->drawFastHLine(ux(34), uy(181), ux(172), 0x4208);
-  snprintf(leftValue, sizeof(leftValue), "%.1f MPH", averageSpeedMph);
-  snprintf(middleValue, sizeof(middleValue), "%.1f MI", distanceMiles);
-  snprintf(rightValue, sizeof(rightValue), "%lu:%02lu",
-           (unsigned long)(seconds / 3600),
-           (unsigned long)((seconds / 60) % 60));
-  if (currentPage == 1) {
-    snprintf(leftValue, sizeof(leftValue), "%d FT", int(roundf(climbFeet)));
-    snprintf(middleValue, sizeof(middleValue), "%.0f FT", filteredElevationFt);
-  } else if (currentPage == 4) {
-    snprintf(leftValue, sizeof(leftValue), "%.0f FT", filteredElevationFt);
-    snprintf(middleValue, sizeof(middleValue),
-             liveGradeValid ? "%+.1f %%" : "-- %%", liveGradePercent);
-  }
-  drawRideStat(leftValue, currentPage == 1 ? "CLIMB" :
-                          (currentPage == 4 ? "ELEV" : "AVG"), ux(65));
-  drawRideStat(middleValue, currentPage == 1 ? "ELEV" :
-                            (currentPage == 4 ? "GRADE" : "DISTANCE"), CENTER);
-  drawRideStat(rightValue, "TIME", ux(175));
   drawRidePageDots();
+  drawPausedBadge();
   endAnimatedFrame();
 }
 
@@ -2236,6 +2385,56 @@ void openDisplayPage(uint32_t now, AppState returnState = RIDE_MENU) {
 }
 void startCountdown(uint32_t now) { appState = COUNTDOWN; countdownStartMs = now; previousDrawMs = 0; }
 
+uint32_t activeRideElapsedMs(uint32_t now) {
+  uint32_t elapsed = now - rideStartMs;
+  if (ridePaused) {
+    const uint32_t currentPauseMs = now - ridePausedAtMs;
+    elapsed = elapsed > currentPauseMs ? elapsed - currentPauseMs : 0;
+  }
+  return elapsed;
+}
+
+void finishRidePause(uint32_t now) {
+  if (!ridePaused) return;
+  const uint32_t pausedMs = now - ridePausedAtMs;
+  // Shift every absolute ride clock forward so the paused interval is absent
+  // from duration, minute averages, GPS timestamps, and average speed.
+  rideStartMs += pausedMs;
+  minuteAccumulatorMs += pausedMs;
+  nextAltitudeSampleMs += pausedMs;
+  ridePreviousMs = now;
+  nextGpsSampleMs = now;
+  ridePausedAtMs = 0;
+  ridePaused = false;
+
+  currentSpeedMph = 0.0f;
+  stationarySinceMs = 0;
+  zeroSpeedSinceMs = now;
+  lastAltitudePacketMs = 0;
+  gradeSampleHead = gradeSampleCount = 0;
+  lastGradeSampleMs = 0;
+  liveGradePercent = 0.0f;
+  liveGradeValid = false;
+  gradeMotionActive = false;
+}
+
+void toggleRidePause(uint32_t now) {
+  if (ridePaused) {
+    finishRidePause(now);
+  } else {
+    // Preserve the partial rolling minute up to the exact pause instant.
+    accumulateMinuteAverages(now);
+    ridePaused = true;
+    ridePausedAtMs = now;
+    ridePreviousMs = now;
+    currentSpeedMph = 0.0f;
+    liveGradeValid = false;
+    gradeMotionActive = false;
+  }
+  appState = RIDING;
+  previousDrawMs = 0;
+}
+
 void storeMinuteAverage() {
   if (!minuteWeightedMs || altitudeSampleCount >= MAX_ALTITUDE_SAMPLES) return;
   altitudeSamples[altitudeSampleCount] = altitudeMinuteWeightedSum / minuteWeightedMs;
@@ -2378,7 +2577,10 @@ void updateLiveGrade(uint32_t now, float gradeElevationFt) {
 }
 
 void startRide(uint32_t now) {
+  gpxTurnPreview.reset();
+  gpxLastProgress=-1;gpxLiveBearing=NAN;gpxGuidance.reset();gpxFixReceived=0;
   appState = RIDING; currentPage = 0; currentSpeedMph = 0;
+  ridePaused = false; ridePausedAtMs = 0;
   rideMaxSpeedMph = 0; distanceMiles = 0; averageSpeedMph = 0;
   climbFeet = 0; filteredElevationFt = 0; climbAnchorFt = 0;
   altitudeFusionInitialized = false;
@@ -2418,9 +2620,10 @@ void startRide(uint32_t now) {
 }
 
 void prepareRideEnd(uint32_t now) {
+  finishRidePause(now);
   accumulateMinuteAverages(now);
   storeMinuteAverage();  // Keep the final partial minute for short rides.
-  summaryRideSeconds = (now - rideStartMs) / 1000;
+  summaryRideSeconds = activeRideElapsedMs(now) / 1000;
   summaryDistanceMiles = distanceMiles; summaryAverageMph = averageSpeedMph;
   summaryClimbFeet = int(roundf(climbFeet)); summaryPage = 0;
   summaryGpsPath[0] = '\0';
@@ -2447,6 +2650,13 @@ void completeRideEnd(bool saveRide) {
 }
 
 void updateRideData(uint32_t now) {
+  if (ridePaused) {
+    ridePreviousMs = now;
+    currentSpeedMph = 0.0f;
+    liveGradeValid = false;
+    gradeMotionActive = false;
+    return;
+  }
   const float deltaHours = (now - ridePreviousMs) / 3600000.0f;
   ridePreviousMs = now;
   LocationPacket packet;
@@ -2457,13 +2667,13 @@ void updateRideData(uint32_t now) {
   portEXIT_CRITICAL(&locationMux);
   const bool fresh = available && timestampIsFresh(now, received, LOCATION_TIMEOUT_MS);
   if (!rideStartEpoch && fresh && packet.timestamp > 0) {
-    rideStartEpoch = packet.timestamp - (now - rideStartMs) / 1000;
+    rideStartEpoch = packet.timestamp - activeRideElapsedMs(now) / 1000;
   }
   if (now >= nextGpsSampleMs) {
     if (fresh && activeGpsFile && gpsSampleCount < MAX_GPS_SAMPLES &&
         (packet.latitudeE7 != 0 || packet.longitudeE7 != 0)) {
       GpsTrackPoint point = {};
-      point.elapsedSeconds = (now - rideStartMs) / 1000;
+      point.elapsedSeconds = activeRideElapsedMs(now) / 1000;
       point.latitudeE7 = packet.latitudeE7;
       point.longitudeE7 = packet.longitudeE7;
       point.altitudeDm = packet.altitudeDm;
@@ -2505,7 +2715,7 @@ void updateRideData(uint32_t now) {
   tripAPendingMiles += distanceIncrement;
   tripBPendingMiles += distanceIncrement;
   if (odometerPendingMiles >= 1.0) saveOdometers();
-  const float seconds = (now - rideStartMs) / 1000.0f;
+  const float seconds = activeRideElapsedMs(now) / 1000.0f;
   if (seconds > 0.1f) averageSpeedMph = distanceMiles / (seconds / 3600.0f);
   // Process altitude only once per received iOS packet. Re-filtering the same
   // sample every loop allowed a single bad reading to become a huge climb.
@@ -2683,6 +2893,10 @@ Gesture pollTouch(uint32_t now) {
   }
   if (!touchActive || now - touchLastMs < TOUCH_RELEASE_MS) return GESTURE_NONE;
   touchActive = false;
+  if (touchCancelConsumed) {
+    touchCancelConsumed=false;
+    return GESTURE_NONE;
+  }
   if (touchAdjustedBrightness) {
     touchAdjustedBrightness = false;
     return GESTURE_NONE;
@@ -2738,11 +2952,16 @@ void showBrandSplash(const char *word, uint32_t durationMs) {
   delay(durationMs);
 }
 
-constexpr uint32_t SPLASH_DOT_COMPLETE_MS = 280;
-constexpr uint32_t SPLASH_RING_COMPLETE_MS = 870;
-constexpr uint32_t SPLASH_P_COMPLETE_MS = 1250;
-constexpr uint32_t SPLASH_TEXT_COMPLETE_MS = 1510;
-constexpr uint32_t SPLASH_END_MS = 1730;
+constexpr uint32_t SPLASH_DOT_COMPLETE_MS = 360;
+constexpr uint32_t SPLASH_RING_COMPLETE_MS = 1100;
+constexpr uint32_t SPLASH_RING_LOCK_MS = 1300;
+constexpr uint32_t SPLASH_NOTCH_COMPLETE_MS = 1430;
+constexpr uint32_t SPLASH_P_COMPLETE_MS = 1750;
+constexpr uint32_t SPLASH_TEXT_COMPLETE_MS = 2100;
+// Hold the finished iOS-style mark for two full seconds, then let the outer
+// ring expand beyond the panel as the logo fades into the app UI.
+constexpr uint32_t SPLASH_HOLD_END_MS = SPLASH_TEXT_COMPLETE_MS + 2000;
+constexpr uint32_t SPLASH_END_MS = SPLASH_HOLD_END_MS + 650;
 constexpr uint16_t SPLASH_LIME = 0xB7E0;  // #B7FF00
 constexpr uint16_t SPLASH_CYAN = 0x067F;  // #00CFFF
 
@@ -2768,7 +2987,8 @@ void splashPoint(float angleDegrees, float radius, int &x, int &y) {
   y = CENTER + lroundf(sinf(radians) * radius);
 }
 
-void drawSplashGear(float progress, float opacity) {
+// Retained as the prior hardware-only sprocket treatment for easy comparison.
+void drawSplashGearLegacy(float progress, float opacity) {
   progress = constrain(progress, 0.0f, 1.0f);
   if (progress <= 0.0f || opacity <= 0.0f) return;
 
@@ -2817,6 +3037,54 @@ void drawSplashGear(float progress, float opacity) {
     const uint16_t color = splashGradientColor(colorX, colorY, opacity);
     canvas->fillTriangle(root1X, root1Y, tip1X, tip1Y, tip2X, tip2Y, color);
     canvas->fillTriangle(root1X, root1Y, tip2X, tip2Y, root2X, root2Y, color);
+  }
+}
+
+void drawSplashGear(float progress, float opacity, float rotationDegrees = 0.0f,
+                    float notchOpacity = 1.0f, float scale = 1.0f) {
+  progress = constrain(progress, 0.0f, 1.0f);
+  if (progress <= 0.0f || opacity <= 0.0f) return;
+
+  // The iOS logo uses a smooth segmented ring, rather than individual gear
+  // teeth: lime across the upper-left, a short white indicator at twelve
+  // o'clock, and cyan across the lower-right. Four narrow black breaks make
+  // the mark read as a modern circular progress control.
+  const float innerRadius = 160.0f * scale;
+  const float outerRadius = 192.0f * scale;
+  constexpr float segmentDegrees = 2.0f;
+  struct RingSegment { float start; float end; bool white; };
+  static constexpr RingSegment segments[] = {
+      {3.0f, 23.0f, true},     // short white top indicator
+      {32.0f, 90.0f, false},   // upper-right lime/green
+      {99.0f, 180.0f, false},  // lower-right cyan
+      {189.0f, 270.0f, false}, // lower-left cyan/green
+      {279.0f, 357.0f, false}, // upper-left lime
+  };
+  const float revealedDegrees = 360.0f * progress;
+
+  for (const RingSegment &segment : segments) {
+    if (revealedDegrees <= segment.start) continue;
+    if (segment.white && notchOpacity <= 0.0f) continue;
+    const float revealedEnd = min(segment.end, revealedDegrees);
+    for (float degree = segment.start; degree < revealedEnd;
+         degree += segmentDegrees) {
+      const float next = min(degree + segmentDegrees, revealedEnd);
+      int outer1X, outer1Y, outer2X, outer2Y;
+      int inner1X, inner1Y, inner2X, inner2Y;
+      splashPoint(-90.0f + degree + rotationDegrees, outerRadius, outer1X, outer1Y);
+      splashPoint(-90.0f + next + rotationDegrees, outerRadius, outer2X, outer2Y);
+      splashPoint(-90.0f + degree + rotationDegrees, innerRadius, inner1X, inner1Y);
+      splashPoint(-90.0f + next + rotationDegrees, innerRadius, inner2X, inner2Y);
+      const uint16_t color = segment.white
+          ? scaleRgb565(WHITE, opacity * notchOpacity)
+          : splashGradientColor(
+              (outer1X + outer2X + inner1X + inner2X) / 4,
+              (outer1Y + outer2Y + inner1Y + inner2Y) / 4, opacity);
+      canvas->fillTriangle(outer1X, outer1Y, outer2X, outer2Y,
+                           inner2X, inner2Y, color);
+      canvas->fillTriangle(outer1X, outer1Y, inner2X, inner2Y,
+                           inner1X, inner1Y, color);
+    }
   }
 }
 
@@ -2892,15 +3160,28 @@ void drawPedalOneSplashFrame(uint32_t elapsed) {
 
   const float ringProgress = splashProgress(
       elapsed, SPLASH_DOT_COMPLETE_MS, SPLASH_RING_COMPLETE_MS);
-  drawSplashGear(ringProgress, 1.0f);
+  // The iOS ring arrives thirty degrees clockwise from its final alignment,
+  // then eases into place. The white notch is deliberately absent while the
+  // ring is moving and appears only after that mechanical-looking lock.
+  const float ringRotation = 30.0f * (1.0f - splashProgress(
+      elapsed, SPLASH_DOT_COMPLETE_MS, SPLASH_RING_LOCK_MS));
+  const float notchOpacity = splashProgress(
+      elapsed, SPLASH_RING_LOCK_MS, SPLASH_NOTCH_COMPLETE_MS);
+  const float exitProgress = splashProgress(
+      elapsed, SPLASH_HOLD_END_MS, SPLASH_END_MS);
+  // Accelerate toward the viewer: once the ring's inner edge has passed the
+  // 233 px panel radius, the whole sprocket cleanly disappears off-screen.
+  const float exitScale = 1.0f + 0.85f * exitProgress;
+  const float logoOpacity = 1.0f - exitProgress;
+  drawSplashGear(ringProgress, 1.0f, ringRotation, notchOpacity, exitScale);
 
   const float pOpacity = splashProgress(
-      elapsed, SPLASH_RING_COMPLETE_MS, SPLASH_P_COMPLETE_MS);
-  drawPedalOneP(pOpacity);
+      elapsed, SPLASH_NOTCH_COMPLETE_MS, SPLASH_P_COMPLETE_MS);
+  drawPedalOneP(pOpacity * logoOpacity);
 
   const float textOpacity = splashProgress(
       elapsed, SPLASH_P_COMPLETE_MS, SPLASH_TEXT_COMPLETE_MS);
-  drawPedalOneWordmark(textOpacity);
+  drawPedalOneWordmark(textOpacity * logoOpacity);
   endAnimatedFrame();
 }
 
@@ -2972,6 +3253,56 @@ void restoreTouchWakePin() {
   attachInterrupt(digitalPinToInterrupt(TP_INT), onTouchInterrupt, FALLING);
 }
 
+void armHardPowerOffTimer(uint64_t timeoutUs) {
+  // A timer wake is deliberately used as the second tier: the ESP32 stays in
+  // normal touch-wake sleep until this deadline, then boots just long enough
+  // to ask the PMIC for a true rail shutdown.
+  esp_sleep_enable_timer_wakeup(timeoutUs);
+}
+
+uint64_t remainingHardPowerOffUs(uint32_t now) {
+  const uint32_t elapsed=nonNegativeElapsedMs(now,lastActivityMs);
+  return elapsed>=HARD_POWER_OFF_MS ? 1000ULL : uint64_t(HARD_POWER_OFF_MS-elapsed)*1000ULL;
+}
+
+bool requestPmicHardPowerOff() {
+  if (!pmicAvailable) return false;
+  // USB insertion is the intended wake path once PWR is inaccessible. Do not
+  // command PMIC shutdown while VBUS is already present: that can immediately
+  // re-power the board instead of producing a stable off state.
+  if (power.isVbusIn()) {
+    Serial.println("Hard power-off skipped: USB-C is present");
+    return false;
+  }
+  Serial.println("Inactivity deadline: PMIC hard power-off");
+  // Timer-only boot has not initialized GPS. Detect its bridge so the backup
+  // command is sent before PMIC removes the main GPS supply.
+  if(!onboardGps.detected())onboardGps.begin(Wire,millis());
+  if(onboardGps.detected() && !onboardGps.prepareForHardPowerOff())
+    Serial.println("GPS backup command failed; backup state is unconfirmed");
+  power.disableBattDetection();
+  power.disableBattVoltageMeasure();
+  power.disableVbusVoltageMeasure();
+  // With USB absent, BATFET-off leaves only the PMIC RTC domain powered. A
+  // later USB-C insertion is the hardware power-on event.
+  power.disableBATFET();
+  delay(20);
+  power.shutdown();
+  delay(100);  // Normally unreachable: PMIC rails have just been removed.
+  return true;
+}
+
+void shutDownAfterTimerBoot() {
+  // Timer wake initializes only I2C, PMIC, and the GPS backup command.
+  Wire.begin(IIC_SDA, IIC_SCL);
+  pmicAvailable = power.begin(Wire, AXP2101_SLAVE_ADDRESS, IIC_SDA, IIC_SCL);
+  if (!pmicAvailable) {
+    Serial.println("PMIC unavailable on hard-off timer wake");
+    return;
+  }
+  requestPmicHardPowerOff();
+}
+
 void enterDeepSleep(bool manualShutdown = false) {
   saveOdometers();
   if (activeGpsFile) {
@@ -2981,6 +3312,7 @@ void enterDeepSleep(bool manualShutdown = false) {
   showShutdownSplash();
   display->setBrightness(0);
   display->displayOff();
+  onboardGps.prepareForSleep();
 
   // Do not let the tap that selected YES satisfy the wake condition, and keep
   // the active-low IRQ pulled high after the digital GPIO domain powers down.
@@ -2999,6 +3331,8 @@ void enterDeepSleep(bool manualShutdown = false) {
   }
   esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL);
   esp_sleep_enable_ext0_wakeup(GPIO_NUM_11, 0);
+  armHardPowerOffTimer(manualShutdown ? HARD_POWER_OFF_MANUAL_US
+                                      : remainingHardPowerOffUs(millis()));
   esp_deep_sleep_start();
 }
 
@@ -3015,9 +3349,12 @@ void enterInactiveSleep() {
   showShutdownSplash();
   display->setBrightness(0);
   display->displayOff();
+  onboardGps.prepareForSleep();
 
   prepareTouchWakePin();
 
+  // The BLE server is initialized even when the user has disabled radio
+  // advertising, so always tear it down before retained light sleep.
   notifications.endForLightSleep();
   statusCharacteristic = nullptr;
   deviceNameCharacteristic = nullptr;
@@ -3030,11 +3367,30 @@ void enterInactiveSleep() {
   }
   esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL);
   esp_sleep_enable_ext0_wakeup(GPIO_NUM_11, 0);
+  armHardPowerOffTimer(remainingHardPowerOffUs(millis()));
   const esp_err_t sleepResult = esp_light_sleep_start();
-  esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_EXT0);
+  const esp_sleep_wakeup_cause_t lightSleepWakeCause = esp_sleep_get_wakeup_cause();
+  esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL);
+  if (lightSleepWakeCause == ESP_SLEEP_WAKEUP_TIMER && requestPmicHardPowerOff()) {
+    // requestPmicHardPowerOff normally removes the rails. If a board-level
+    // wiring change prevented that, do not resume an abandoned ride.
+    return;
+  }
   restoreTouchWakePin();
   Serial.printf("Light sleep returned: %s, wake=%d\n",
-                esp_err_to_name(sleepResult), int(esp_sleep_get_wakeup_cause()));
+                esp_err_to_name(sleepResult), int(lightSleepWakeCause));
+
+  const uint32_t wakeMs = millis();
+  onboardGps.resumeAfterLightSleep(wakeMs);
+  if (onboardGpsPresent) {
+    portENTER_CRITICAL(&locationMux);
+    hasLocation = false;
+    lastLocationMs = 0;
+    bleBarometerAvailable = false;
+    lastBleBarometerMs = 0;
+    portEXIT_CRITICAL(&locationMux);
+    lastOnboardGpsSequence = 0;
+  }
 
   // Recreate the BLE server and characteristics after the light-sleep wake.
   // The phone can reconnect while the retained ride resumes from the same
@@ -3057,7 +3413,6 @@ void enterInactiveSleep() {
   // Resume the same ride without integrating the sleeping interval as motion
   // or backfilling it with fake minute/GPS samples. Re-baseline the phone's
   // altitude sources onto the retained fused elevation on their first packet.
-  const uint32_t wakeMs = millis();
   ridePreviousMs = wakeMs;
   minuteAccumulatorMs = wakeMs;
   nextAltitudeSampleMs = wakeMs + 60000;
@@ -3087,7 +3442,7 @@ void moveSelection(int direction, uint32_t now) {
     ancsHistoryPage = constrain(next, 0, int(ancsHistoryCount));
   }
   else if (appState == MENU || appState == OPTIONS_MENU || appState == RIDE_MENU) {
-    const int count = appState == MENU ? 1 : (appState == OPTIONS_MENU ? 6 : 4);
+    const int count = appState == MENU ? 1 : (appState == OPTIONS_MENU ? 7 : 2);
     menuSelection = (menuSelection + direction + count) % count;
   } else if (appState == DISPLAY_PAGE) {
     int next = int(normalBrightness) + direction * 16;
@@ -3140,15 +3495,15 @@ void activate(uint32_t now) {
     // Keep the visual button compact, but provide a generous touch target.
     const bool onMenu = lastTapX >= ux(60) && lastTapX <= ux(180) &&
                         lastTapY >= uy(185) && lastTapY <= uy(239);
-    if (onStart) startCountdown(now);
+    if (onStart) { appState=START_ROUTE_MENU;previousDrawMs=0; }
     else if (onMenu) openOptionsMenu();
     else { appState = READY; previousDrawMs = 0; }
   } else if (appState == OPTIONS_MENU) {
-    const int halfWidths[] = {60, 85, 82, 48, 105, 34};
+    const int halfWidths[] = {60, 85, 85, 82, 48, 82, 34};
     int hit = -1;
-    for (int i = 0; i < 6; ++i) {
+    for (int i = 0; i < 7; ++i) {
       if (abs(lastTapX - CENTER) <= ux(halfWidths[i]) &&
-          abs(lastTapY - uy(50 + i * 31)) <= uy(14)) {
+          abs(lastTapY - uy(49 + i * 26)) <= uy(13)) {
         hit = i;
         break;
       }
@@ -3160,27 +3515,19 @@ void activate(uint32_t now) {
       statusPage = 0;
       appState = STATUS_PAGE;
       previousDrawMs = 0;
-    } else if (hit == 1) openDisplayPage(now, OPTIONS_MENU);
-    else if (hit == 2) {
+    } else if (hit == 1) { appState=BLUETOOTH_PAGE;previousDrawMs=0; }
+    else if (hit == 2) openDisplayPage(now, OPTIONS_MENU);
+    else if (hit == 3) {
       statusReturnState = OPTIONS_MENU;
       statusPage = 1;
       appState = STATUS_PAGE;
       previousDrawMs = 0;
-    } else if (hit == 3) {
+    } else if (hit == 4) {
       ridesEditMode = false;
       appState = RIDES_LIST;
       previousDrawMs = 0;
-    } else if (hit == 4) {
-      portENTER_CRITICAL(&navMux);
-      navVisible = false;
-      portEXIT_CRITICAL(&navMux);
-      ancsHistoryCount = 0;
-      ancsHistoryPage = 0;
-      // PedalOne's iOS test path has its own allowlisted bundle identifier, so
-      // diagnostics can remain filtered without admitting Slack or Messages.
-      notifications.setAcceptAll(false);
-      appState = ANCS_TEST;
-      previousDrawMs = 0;
+    } else if (hit == 5) {
+      routeSelectionForStart=false;selectedRouteRow=0; appState = ROUTES_LIST; previousDrawMs = 0;
     } else requestConfirmation(ACTION_POWER_OFF, OPTIONS_MENU);
   } else if (appState == ANCS_TEST) {
     const bool exit = lastTapX >= ux(65) && lastTapX <= ux(175) &&
@@ -3223,21 +3570,29 @@ void activate(uint32_t now) {
     } else if (!ridesEditMode && hit >= 0) loadSavedRide(hit);
     else openOptionsMenu();
   } else if (appState == RIDE_MENU) {
-    const int halfWidths[] = {55, 75, 105, 50};
-    int hit = -1;
-    for (int i = 0; i < 4; ++i) {
-      if (abs(lastTapX - CENTER) <= ux(halfWidths[i]) &&
-          abs(lastTapY - uy(61 + i * 47)) <= uy(21)) {
-        hit = i;
-        break;
-      }
+    const bool onStatus = lastTapX>=ux(20) && lastTapX<ux(120) &&
+                          lastTapY>=uy(88) && lastTapY<uy(174);
+    const bool onBrightness = lastTapX>=ux(120) && lastTapX<=ux(220) &&
+                              lastTapY>=uy(88) && lastTapY<uy(174);
+    const bool onPauseResume = lastTapX >= ux(8) && lastTapX <= ux(119) &&
+                               lastTapY >= uy(174);
+    const bool onStop = lastTapX >= ux(121) && lastTapX <= ux(232) &&
+                        lastTapY >= uy(174);
+    if (onStatus) {
+      statusReturnState = RIDE_MENU;
+      statusPage = 0;
+      appState = STATUS_PAGE;
+      previousDrawMs = 0;
+    } else if (onBrightness) {
+      openDisplayPage(now);
+    } else if (onPauseResume) {
+      toggleRidePause(now);
+    } else if (onStop) {
+      requestConfirmation(ACTION_END_RIDE, RIDE_MENU);
+    } else {
+      appState = RIDING;
+      previousDrawMs = 0;
     }
-    if (hit < 0) { appState = RIDING; previousDrawMs = 0; return; }
-    menuSelection = hit;
-    if (menuSelection == 0) { appState = RIDING; previousDrawMs = 0; }
-    else if (menuSelection == 1) { statusReturnState = RIDE_MENU; statusPage = 0; appState = STATUS_PAGE; previousDrawMs = 0; }
-    else if (menuSelection == 2) openDisplayPage(now);
-    else requestConfirmation(ACTION_END_RIDE, RIDE_MENU);
   } else if (appState == STATUS_PAGE) {
     if (statusPage == 1 && lastTapY >= uy(184) && lastTapY <= uy(225)) {
       if (lastTapX >= ux(22) && lastTapX <= ux(120))
@@ -3279,6 +3634,9 @@ void setup() {
   Serial.printf("Boot wake=%s (%d), reset=%s (%d)\n",
                 wakeCauseName(bootWakeCause), int(bootWakeCause),
                 resetReasonName(bootResetReason), int(bootResetReason));
+  if (bootWakeCause == ESP_SLEEP_WAKEUP_TIMER) {
+    shutDownAfterTimerBoot();
+  }
   setCpuFrequencyMhz(160);
   // Mount ride storage before the framebuffer and BLE stack reserve memory.
   // If the known-bad wear-levelling metadata is encountered, 2.0.21 performs
@@ -3307,6 +3665,8 @@ void setup() {
     Serial.println("CST9217 initialization failed");
     while (true) delay(1000);
   }
+  Wire.setBufferSize(1100);
+  Wire.setTimeOut(100);
   touch.setMaxCoordinates(SCREEN_SIZE, SCREEN_SIZE);
   touch.setMirrorXY(true, true);
   pinMode(TP_INT, INPUT_PULLUP);
@@ -3319,24 +3679,39 @@ void setup() {
   // Original startup splash fallback (kept intentionally):
   // showBrandSplash("HIO", 2000);
   showPedalOneStartupSplash();
+  onboardGpsPresent = onboardGps.begin(Wire, millis());
+  Serial.printf("Location source: %s\n",
+                onboardGpsPresent ? "onboard LC76G" : "BLE GPS relay");
   setenv("TZ", "PST8PDT,M3.2.0,M11.1.0", 1);
   tzset();
+  gpxLibrary.restore(rideStorageReady);
   loadOdometers();
   loadDeviceNickname();
+  if(deviceStorageReady)bluetoothEnabled=devicePreferences.getBool("ble_on",true);
   setupBluetooth();
   lastActivityMs = millis();
   drawReadyScreen(millis());
+  if (PEDALONE_GPX_DEMO_BOOT) {
+    gpxSimulation.reset(millis()); appState = GPX_DEMO; previousDrawMs = 0;
+    Serial.printf("GPX playback: %.3f mi at 40 mph\n", gpx::length()/1609.344f);
+  }
 }
 
 void loop() {
-  const uint32_t now = millis();
-  notifications.loop();
-  otaUpdate.loop(phoneConnected);
+  uint32_t now = millis();
+  if(bluetoothEnabled) { notifications.loop(); otaUpdate.loop(phoneConnected); }
   if (otaUpdate.active() != otaLinkFast) {
     otaLinkFast = otaUpdate.active();
     notifications.setOtaMode(otaLinkFast);
   }
   updateBattery(now);
+  const bool routeCanChange = (appState==READY || appState==MENU || appState==OPTIONS_MENU ||
+      appState==GPX_DEMO || appState==ROUTES_LIST || appState==START_ROUTE_MENU) && !otaUpdate.active() && !otaUpdate.rebootPending();
+  if(bluetoothEnabled) gpxLibrary.loop(routeCanChange);
+  if(gpxLibrary.changed) {
+    gpxLibrary.changed=false; gpxSimulation.reset(now); gpxLastProgress=-1; gpxLiveBearing=NAN;gpxGuidance.reset();gpxFixReceived=0;
+    previousDrawMs=0;
+  }
   if (otaUpdate.active() || otaUpdate.rebootPending()) {
     if (!previousDrawMs || now - previousDrawMs >= 250) {
       previousDrawMs = now;
@@ -3347,11 +3722,114 @@ void loop() {
     return;
   }
   const Gesture gesture = pollTouch(now);
-  const bool navigationActive = appState != ANCS_TEST &&
+  // Keep acquisition running on route selection and playback screens too:
+  // those modal screens return before the normal ride drawing path.
+  if (onboardGpsPresent) {
+    onboardGps.service(millis());
+    publishOnboardGpsFix(millis());
+  }
+  now=millis(); // GPS reads may have published a fix after this loop began.
+  if(appState==BLUETOOTH_PAGE) {
+    if(gesture==GESTURE_UP) {openOptionsMenu();return;}
+    if(gesture==GESTURE_TAP || gesture==GESTURE_LEFT || gesture==GESTURE_RIGHT) {
+      if(gesture==GESTURE_TAP && (lastTapY<uy(105) || lastTapY>uy(165))) {
+        openOptionsMenu();return;
+      }
+      const bool enabled=gesture==GESTURE_RIGHT || (gesture==GESTURE_TAP && lastTapX>=CENTER);
+      if(enabled!=bluetoothEnabled) {
+        bluetoothEnabled=enabled;
+        if(deviceStorageReady)devicePreferences.putBool("ble_on",enabled);
+        notifications.setEnabled(enabled);
+        if(!enabled)phoneConnected=false;
+      }
+      previousDrawMs=0;
+    }
+    if(!previousDrawMs || now-previousDrawMs>=1000) {
+      previousDrawMs=now;drawBluetoothPage(now);
+    }
+    if(lastActivityMs && now-lastActivityMs>=AUTO_POWER_OFF_MS)enterLowPowerSleep();
+    delay(5);return;
+  }
+  if(appState==START_ROUTE_MENU) {
+    if(gesture==GESTURE_UP) {appState=MENU;previousDrawMs=0;return;}
+    if(gesture==GESTURE_TAP) {
+      const bool inButtonColumn=lastTapX>=ux(26) && lastTapX<=ux(214);
+      if(inButtonColumn && lastTapY>=uy(80) && lastTapY<=uy(128)) {
+        ignoreTouchUntilMs=now+MENU_TOUCH_LOCKOUT_MS;routeSelectionForStart=true;selectedRouteRow=0;appState=ROUTES_LIST;previousDrawMs=0;
+      } else if(inButtonColumn && lastTapY>=uy(142) && lastTapY<=uy(190)) {
+        routeNavigationEnabled=false;startCountdown(now);
+      } else {
+        openMenu();
+      }
+    }
+    if(appState==START_ROUTE_MENU && (!previousDrawMs || now-previousDrawMs>=500)) {
+      previousDrawMs=now;drawStartRouteMenu();
+    }
+    if(lastActivityMs && now-lastActivityMs>=AUTO_POWER_OFF_MS)enterLowPowerSleep();
+    delay(5);return;
+  }
+  if(appState==ROUTES_LIST) {
+    if(lastActivityMs && now-lastActivityMs>=AUTO_POWER_OFF_MS) {enterLowPowerSleep();return;}
+    const int count=max(1,int(gpxLibrary.routeCount));
+    selectedRouteRow=constrain(selectedRouteRow,0,count-1);
+    if(gesture==GESTURE_TAP && lastTapY>=uy(95) && lastTapY<uy(178)) {
+      selectedRouteRow=(selectedRouteRow+(lastTapX<CENTER ? count-1 : 1))%count;
+    }
+    if(gesture==GESTURE_UP) {appState=routeSelectionForStart ? START_ROUTE_MENU : OPTIONS_MENU;previousDrawMs=0;return;}
+    if(gpxLibrary.routeCount && routeSelectionForStart && gesture==GESTURE_TAP &&
+       lastTapY>=uy(182) && lastTapY<=uy(222) &&
+       lastTapX>=ux(66) && lastTapX<=ux(174)) {
+      bool ok=true;
+      if(gpxLibrary.routeCount) ok=gpxLibrary.select(gpxLibrary.routes[selectedRouteRow].id);
+      else gpxLibrary.useExample();
+      if(ok) {
+        routeNavigationEnabled=true;routeSelectionForStart=false;startCountdown(now);
+      }
+      previousDrawMs=0;return;
+    }
+    if(gesture!=GESTURE_NONE)previousDrawMs=0;
+    if(!previousDrawMs || now-previousDrawMs>=250) {previousDrawMs=now;drawRouteLibrary(now);}
+    delay(5);return;
+  }
+  // Playback has its own clock and never enters the ride recorder or odometer path.
+  if (appState == GPX_DEMO) {
+    gpxSimulation.tick(now);
+    if (gesture == GESTURE_UP) { appState = READY; previousDrawMs = 0; return; }
+    if (gesture == GESTURE_TAP) {
+      if (gpxSimulation.finished()) gpxSimulation.reset(now);
+      else gpxSimulation.paused = !gpxSimulation.paused;
+      previousDrawMs = 0;
+    }
+    lastActivityMs = now;
+    if (!previousDrawMs || now-previousDrawMs >= 83) {
+      previousDrawMs = now;
+      drawGpxRoute(gpxSimulation.meters, true, true, 0);
+    }
+    static uint32_t reportMs = 0;
+    if (now-reportMs >= 10000 && Serial && Serial.availableForWrite()>=160) {
+      reportMs = now;
+      const auto position = gpx::sample(gpxSimulation.meters);
+      Serial.printf("GPX SIM %.1fm / %.1fm speed=%.1fmph east=%.1f north=%.1f paused=%d\n",
+          gpxSimulation.meters, gpx::length(),
+          gpxSimulation.paused || gpxSimulation.finished() ? 0.0 : 40.0,
+          position.east, position.north, gpxSimulation.paused);
+    }
+    delay(5);
+    return;
+  }
+  const bool navigationActive = !(routeNavigationEnabled && (appState==RIDING || appState==RIDE_MENU)) &&
+      appState != ANCS_TEST &&
       appState != SAVE_RIDE_PROMPT && appState != CONFIRM_PAGE &&
       navigationIsVisible(now);
 
-  if (navigationActive && gesture == GESTURE_TAP) {
+  if (appState==RIDING && gpxTurnPreview.active && gesture==GESTURE_TAP) {
+    gpxTurnPreview.dismiss(currentPage);
+    previousDrawMs=0;
+  } else if (appState==RIDING && gpxTurnPreview.active &&
+             (gesture==GESTURE_LEFT || gesture==GESTURE_RIGHT)) {
+    gpxTurnPreview.active=false;
+    moveSelection(gesture==GESTURE_LEFT ? 1 : -1,now);
+  } else if (navigationActive && gesture == GESTURE_TAP) {
     portENTER_CRITICAL(&navMux);
     navVisible = false;
     portEXIT_CRITICAL(&navMux);
@@ -3384,12 +3862,31 @@ void loop() {
       (appState == DISPLAY_PAGE && displayReturnState == RIDE_MENU) ||
       (appState == STATUS_PAGE && statusReturnState == RIDE_MENU) || appState == RIDING)
     updateRideData(now);
-  if (appState == COUNTDOWN && now - countdownStartMs >= 3000) startRide(now);
+  if (appState == COUNTDOWN) {
+    if (touchActive && nonNegativeElapsedMs(now,touchStartMs)>=2000) {
+      touchCancelConsumed=true;
+      routeNavigationEnabled=false;
+      routeSelectionForStart=false;
+      openMenu();
+    } else if (!touchActive && now-countdownStartMs>=3000) {
+      // A hold begun near the end gets its full two seconds before starting.
+      startRide(now);
+    }
+  }
 
   const bool activeRide = appState == RIDING || appState == RIDE_MENU ||
       (appState == DISPLAY_PAGE && displayReturnState == RIDE_MENU) ||
       (appState == STATUS_PAGE && statusReturnState == RIDE_MENU);
-  if (activeRide) updateAutoBrightness(now);
+  if (activeRide) {
+    updateAutoBrightness(now);
+    if(routeNavigationEnabled)updateGpxPosition(now);
+    if(appState==RIDING && routeNavigationEnabled && gpxFixAvailable && !ridePaused) {
+      const int previousPage=currentPage;
+      const auto cue=gpx::nextCue(max(gpxLastProgress,gpxTurnPreview.handledThrough));
+      gpxTurnPreview.update(gpxLastProgress,cue,gpxGuidance.mode()==gpx::ON_ROUTE,currentPage);
+      if(currentPage!=previousPage)previousDrawMs=0;
+    }
+  }
 
   if (lastActivityMs && now - lastActivityMs >= AUTO_POWER_OFF_MS) {
     if (activeRide) enterInactiveSleep();
@@ -3416,7 +3913,11 @@ void loop() {
     else if (appState == RIDING) drawRidePage(now);
     else if (appState == CONFIRM_PAGE) drawConfirmation(now);
     else if (appState == SAVE_RIDE_PROMPT) drawSaveRidePrompt(now);
-    else drawSummary(now);
+    else if (appState == BLUETOOTH_PAGE) drawBluetoothPage(now);
+    else if (appState == START_ROUTE_MENU) drawStartRouteMenu();
+    else if (appState == ROUTES_LIST) drawRouteLibrary(now);
+    else if (appState == SUMMARY) drawSummary(now);
   }
+
   delay(5);
 }
