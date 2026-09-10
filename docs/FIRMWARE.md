@@ -40,15 +40,15 @@ compiled successfully on 2026-08-22:
    profile used for the verified build was:
 
    ```text
-   esp32:esp32:esp32s3:FlashSize=16M,PartitionScheme=app3M_fat9M_16MB,PSRAM=opi,USBMode=hwcdc,CDCOnBoot=cdc
+   esp32:esp32:esp32s3:FlashSize=16M,PartitionScheme=app3M_fat9M_16MB,PSRAM=opi,USBMode=hwcdc,CDCOnBoot=cdc,CPUFreq=160
    ```
 
 3. Compile and upload `firmware/PedalOS/PedalOS.ino` over USB for the first
    OTA-enabled installation.
 
-The verified v2.1.12 compile used 932,283 bytes of application space and 62,732
-bytes of global RAM. The application image was also flashed and verified on the
-target device.
+The verified v2.1.37 compile used 1,512,943 bytes of application space and
+88,028 bytes of global RAM. Its OTA application image is 1,513,200 bytes,
+leaving ample room in the 3 MiB application slot.
 
 ## BLE firmware update protocol
 

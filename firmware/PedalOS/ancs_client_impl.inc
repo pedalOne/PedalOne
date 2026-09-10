@@ -57,9 +57,13 @@ class AncsSecurityCallbacks : public BLESecurityCallbacks {
 AncsClient *AncsClient::instance_ = nullptr;
 
 void AncsClient::begin(const char *deviceName) {
+  running_=true;
   instance_ = this;
   deviceName_ = deviceName;
   BLEDevice::init(deviceName);
+  BLEDevice::setPower(ESP_PWR_LVL_P3, ESP_BLE_PWR_TYPE_DEFAULT);
+  BLEDevice::setPower(ESP_PWR_LVL_P3, ESP_BLE_PWR_TYPE_ADV);
+  BLEDevice::setPower(ESP_PWR_LVL_P3, ESP_BLE_PWR_TYPE_SCAN);
   BLEDevice::setMTU(247);
   BLEDevice::setSecurityCallbacks(new AncsSecurityCallbacks());
   auto *security = new BLESecurity();
@@ -84,11 +88,15 @@ void AncsClient::begin(const char *deviceName) {
       kDeviceNameUuid,
       BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_WRITE |
           BLECharacteristic::PROPERTY_NOTIFY);
+  bridgeService->createCharacteristic(
+      "8E400007-F315-4F60-9FB8-838830DAEA50",
+      BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_WRITE);
   bridgeService->start();
   ble_gap_event_listener_register(new ble_gap_event_listener(), gapEvent, this);
 }
 
 void AncsClient::endForLightSleep() {
+  running_=false; // Disconnect callbacks must not restart advertising.
   // Stop NimBLE without releasing controller memory so begin() can recreate
   // the GATT server after light sleep. Clear per-connection state because all
   // handles and service pointers become invalid during deinitialization.
@@ -113,7 +121,37 @@ void AncsClient::endForLightSleep() {
   if (stateCallback_) stateCallback_(Disconnected);
 }
 
+void AncsClient::setEnabled(bool enabled) {
+  if (enabled == running_) {
+    if (enabled && connHandle_ == 0xffff) startAdvertising();
+    return;
+  }
+
+  running_ = enabled;
+  if (enabled) {
+    startAdvertising();
+    return;
+  }
+
+  // Keep the controller and GATT database alive while the device is awake.
+  // Reinitializing NimBLE from the touch handler can race its host task and
+  // reset the ESP32. A disabled client simply stops advertising and drops the
+  // active phone link; onDisconnected() will not restart advertising because
+  // running_ is already false.
+  BLEDevice::getAdvertising()->stop();
+  shouldDiscover_ = false;
+  ready_ = false;
+  requestInFlight_ = false;
+  queueCount_ = 0;
+  if (connHandle_ != 0xffff && server_) {
+    server_->disconnect(connHandle_);
+  } else if (stateCallback_) {
+    stateCallback_(Disconnected);
+  }
+}
+
 void AncsClient::startAdvertising() {
+  if(!running_)return;
   BLEAdvertising *advertising = BLEDevice::getAdvertising();
   advertising->stop();
   BLEAdvertisementData data;
@@ -213,6 +251,7 @@ int AncsClient::mtuComplete(uint16_t conn, const ble_gatt_error *error,
 }
 
 void AncsClient::loop() {
+  if(!running_)return;
   const uint32_t now = millis();
   if (shouldDiscover_ && connHandle_ != 0xffff) {
     shouldDiscover_ = false;

@@ -43,6 +43,9 @@ class AncsClient {
 
   void begin(const char *deviceName);
   void endForLightSleep();
+  // Enable or disable the already-created BLE server without rebuilding its
+  // GATT database. This keeps the settings toggle safe while the app is awake.
+  void setEnabled(bool enabled);
   void loop();
   void setStateCallback(StateCallback cb) { stateCallback_ = cb; }
   void setNotificationCallback(NotificationCallback cb) { notificationCallback_ = cb; }
@@ -102,6 +105,7 @@ class AncsClient {
   static bool isNavigationApp(const String &appId);
 
   BLEServer *server_ = nullptr;
+  bool running_ = false;
   String deviceName_;
   StateCallback stateCallback_ = nullptr;
   NotificationCallback notificationCallback_ = nullptr;

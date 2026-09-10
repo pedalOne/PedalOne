@@ -19,12 +19,13 @@ The code presently includes:
 - Apple Notification Center Service handling for navigation notifications;
 - application-image updates over BLE.
 
-The current firmware is PedalOS v2.1.12. It includes the animated PedalOne
-startup identity, filtered ANCS navigation, GPS relay support, saved rides,
-odometer persistence, and BLE application-image updates.
+The current firmware is PedalOS v2.1.37. It includes the animated PedalOne
+startup identity, filtered ANCS navigation, onboard-GPS and phone-relay support,
+GPX route navigation, saved rides, odometer persistence, and BLE
+application-image updates.
 
 The matching OTA application image and checksum manifest are in
-[`release/v2.1.12/`](release/v2.1.12/).
+[`release/v2.1.37/`](release/v2.1.37/).
 
 ## Repository layout
 
