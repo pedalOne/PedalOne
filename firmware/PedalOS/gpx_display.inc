@@ -113,15 +113,20 @@ void drawGpxRoute(float meters, bool demo, bool hasFix, float offset) {
     previousVisible=visible; previousX=x; previousY=y;
   }
   char distance[32];
-  const bool guidance=mode!=gpx::ON_ROUTE;
-  const uint16_t guidanceColor=mode==gpx::OFF_COURSE ? 0xF81F : WHITE;
   const auto target=mode==gpx::TO_START ? gpx::sample(0) : gpxNearestCoursePoint;
+  const bool guidance=mode!=gpx::ON_ROUTE;
+  const float recoveryMeters=guidance ? gpx::pointDistance(position,target) : 0.0f;
+  // Near-course recovery uses familiar road-sign yellow. Magenta is reserved
+  // for a substantial detour of one mile or more.
+  constexpr uint16_t trafficSignYellow=0xFE60; // approximately #FFD000
+  const uint16_t guidanceColor=mode==gpx::OFF_COURSE
+      ? (recoveryMeters<1609.344f ? trafficSignYellow : 0xF81F)
+      : WHITE;
   const auto cue = !demo && gpxTurnPreview.active ? gpxTurnPreview.cue : gpx::nextCue(meters);
   const float remaining = max(0.0f,cue.meters-meters);
   if (remaining >= 160.9344f) snprintf(distance,sizeof(distance),"%.1f mi",remaining/1609.344f);
   else snprintf(distance,sizeof(distance),"%.0f ft",remaining*3.28084f);
   if(guidance) {
-    const float recoveryMeters=gpx::pointDistance(position,target);
     if(recoveryMeters>=160.9344f)snprintf(distance,sizeof(distance),"%.1f mi",recoveryMeters/1609.344f);
     else snprintf(distance,sizeof(distance),"%.0f ft",recoveryMeters*3.28084f);
   }
@@ -152,14 +157,32 @@ void drawGpxRoute(float meters, bool demo, bool hasFix, float offset) {
     // local map. The large direction arrow remains visible at any distance.
     const float targetEast=(target.east-position.east)*eastScale;
     const float targetNorth=target.north-position.north;
-    const int targetX=CENTER+lroundf((targetEast*cosine-targetNorth*sine)*pixelsPerMeter);
-    const int targetY=342-lroundf((targetEast*sine+targetNorth*cosine)*pixelsPerMeter);
+    const float screenDx=(targetEast*cosine-targetNorth*sine)*pixelsPerMeter;
+    const float screenDy=-(targetEast*sine+targetNorth*cosine)*pixelsPerMeter;
+    const int targetX=CENTER+lroundf(screenDx);
+    const int targetY=342+lroundf(screenDy);
     const bool targetVisible=targetX>45 && targetX<421 && targetY>270 && targetY<432 &&
-        (targetX-CENTER)*(targetX-CENTER)+(targetY-CENTER)*(targetY-CENTER)<205*205;
+        screenDx*screenDx+screenDy*screenDy<205.0f*205.0f;
+    int lineX=targetX,lineY=targetY;
+    if(!targetVisible) {
+      // Route matching continues even when the ordered rejoin point is beyond
+      // this local map. Clip the recovery line to the visible map boundary so
+      // the rider can still see that guidance remains active.
+      const float dx=screenDx,dy=screenDy;
+      float edgeScale=1.0f;
+      if(dx>0.0f)edgeScale=min(edgeScale,178.0f/dx);
+      else if(dx<0.0f)edgeScale=min(edgeScale,-178.0f/dx);
+      if(dy>0.0f)edgeScale=min(edgeScale,86.0f/dy);
+      else if(dy<0.0f)edgeScale=min(edgeScale,-68.0f/dy);
+      lineX=CENTER+lroundf(dx*edgeScale);
+      lineY=342+lroundf(dy*edgeScale);
+    }
+    wideLine(CENTER,342,lineX,lineY,targetVisible ? 2 : 3,guidanceColor);
     if(targetVisible) {
-      wideLine(CENTER,342,targetX,targetY,2,guidanceColor);
       canvas->fillCircle(targetX,targetY,8,WHITE);
       canvas->fillCircle(targetX,targetY,4,routeBlue);
+    } else {
+      canvas->fillCircle(lineX,lineY,5,guidanceColor);
     }
   }
   canvas->fillCircle(CENTER,342,20,WHITE);

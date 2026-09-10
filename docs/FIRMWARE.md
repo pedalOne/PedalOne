@@ -46,8 +46,8 @@ compiled successfully on 2026-08-22:
 3. Compile and upload `firmware/PedalOS/PedalOS.ino` over USB for the first
    OTA-enabled installation.
 
-The verified v2.1.37 compile used 1,512,943 bytes of application space and
-88,028 bytes of global RAM. Its OTA application image is 1,513,200 bytes,
+The verified v2.1.38 compile used 1,513,235 bytes of application space and
+88,028 bytes of global RAM. Its OTA application image is 1,513,488 bytes,
 leaving ample room in the 3 MiB application slot.
 
 ## BLE firmware update protocol
