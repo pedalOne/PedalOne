@@ -36,7 +36,11 @@
 #include "wifi_config.h"
 #include "pin_config.h"
 #include "gpx_navigation.h"
+#include "device_icon.h"
 #include "gpx_library.h"
+#include "shared_map.h"
+#include "pq_map.h"
+#include "rider_network.h"
 #ifndef PEDALONE_GPX_DEMO_BOOT
 #define PEDALONE_GPX_DEMO_BOOT 0
 #endif
@@ -48,7 +52,8 @@
 constexpr int SCREEN_SIZE = 466;
 constexpr int CENTER = SCREEN_SIZE / 2;
 constexpr float UI_SCALE = SCREEN_SIZE / 240.0f;
-constexpr int PAGE_COUNT = 3;
+constexpr int PAGE_COUNT = 4;
+constexpr int RIDAR_PAGE_INDEX = gpx::PAGE_INDEX + 1;
 constexpr int BOOT_BUTTON_PIN = 0;
 constexpr uint32_t LONG_PRESS_MS = 1500;
 constexpr int SWIPE_THRESHOLD = 40;
@@ -56,6 +61,8 @@ constexpr int SWIPE_VERTICAL_LIMIT = 140;
 constexpr uint32_t TOUCH_RELEASE_MS = 90;
 constexpr uint32_t TOUCH_POLL_MS = 15;
 constexpr uint32_t MENU_TOUCH_LOCKOUT_MS = 350;
+constexpr uint32_t PAGE_TOUCH_LOCKOUT_MS = 250;
+constexpr uint32_t COUNTDOWN_CANCEL_TOUCH_LOCKOUT_MS = 750;
 #ifndef PEDALONE_POWER_TEST
 #define PEDALONE_POWER_TEST 0
 #endif
@@ -88,12 +95,13 @@ constexpr uint16_t MUSHROOM_TAN = 0xDDB0;
 
 constexpr char BLE_DEVICE_NAME[] = "PedalOne";
 constexpr char LEGACY_BLE_DEVICE_NAME[] = "RAC9000";
-constexpr char FW_VERSION[] = "2.1.38";
+constexpr char FW_VERSION[] = "2.1.78";
 constexpr char BLE_SERVICE_UUID[] = "8E400001-F315-4F60-9FB8-838830DAEA50";
 constexpr char BLE_LOCATION_UUID[] = "8E400002-F315-4F60-9FB8-838830DAEA50";
 constexpr char BLE_STATUS_UUID[] = "8E400003-F315-4F60-9FB8-838830DAEA50";
 constexpr char BLE_DEVICE_NAME_UUID[] = "8E400006-F315-4F60-9FB8-838830DAEA50";
 constexpr size_t BLE_DEVICE_NAME_MAX_BYTES = 24;
+constexpr size_t BLE_DEVICE_EMOJI_MAX_BYTES = 16;
 constexpr uint32_t LOCATION_TIMEOUT_MS = 4000;
 constexpr uint32_t GPS_STATUS_TIMEOUT_MS = 30000;
 constexpr uint32_t NAV_TIMEOUT_MS = 20000;
@@ -161,12 +169,14 @@ static_assert(sizeof(LocationPacket) == 28, "Location packet v2 must be 28 bytes
 
 enum AppState { READY, MENU, OPTIONS_MENU, RIDES_LIST, ANCS_TEST, RIDE_MENU, STATUS_PAGE,
                 DISPLAY_PAGE, COUNTDOWN, RIDING, SUMMARY, CONFIRM_PAGE,
-                SAVE_RIDE_PROMPT, GPX_DEMO, ROUTES_LIST, START_ROUTE_MENU, BLUETOOTH_PAGE };
+                SAVE_RIDE_PROMPT, GPX_DEMO, ROUTES_LIST, START_ROUTE_MENU,
+                BLUETOOTH_PAGE, RIDE_CANCELED };
 enum Gesture { GESTURE_NONE, GESTURE_TAP, GESTURE_LEFT, GESTURE_RIGHT,
-               GESTURE_UP };
+               GESTURE_UP, GESTURE_POWER_OFF, GESTURE_ODOMETER_RESET,
+               GESTURE_START_DEMO };
 enum PendingAction { ACTION_NONE, ACTION_END_RIDE, ACTION_POWER_OFF,
                      ACTION_RESET_TRIP_A, ACTION_RESET_TRIP_B,
-                     ACTION_DELETE_RIDE };
+                     ACTION_RESET_ODOMETER, ACTION_DELETE_RIDE };
 enum Maneuver {
   MANEUVER_GENERIC, MANEUVER_LEFT, MANEUVER_RIGHT, MANEUVER_SLIGHT_LEFT,
   MANEUVER_SLIGHT_RIGHT, MANEUVER_SHARP_LEFT, MANEUVER_SHARP_RIGHT,
@@ -188,6 +198,8 @@ Preferences odometerPreferences;
 Preferences devicePreferences;
 OtaUpdate otaUpdate;
 WifiConfig wifiConfig;
+DeviceIconStore deviceIcon;
+RiderNetwork riderNetwork;
 bool otaLinkFast = false;
 
 AppState appState = READY;
@@ -196,7 +208,17 @@ AppState displayReturnState = RIDE_MENU;
 AppState confirmReturnState = MENU;
 PendingAction pendingAction = ACTION_NONE;
 gpx::Simulation gpxSimulation;
+constexpr uint32_t PQ_LOOP_ROUTE_ID = 0x25acf895u;
+bool demoRideActive = false;
+bool demoStartHoldActive = false;
+uint32_t demoStartHoldMs = 0;
+uint32_t demoPreviousRouteId = 0;
+float demoRouteMeters = 0.0f;
+float demoTargetSpeedMph = 14.0f;
+uint32_t demoNextSpeedTargetMs = 0;
+uint32_t demoRandomState = 0x50454441u;
 GpxLibrary gpxLibrary;
+SharedMapLibrary sharedMap;
 int selectedRouteRow=0;
 bool routeSelectionForStart=false, routeNavigationEnabled=false;
 int currentPage = 0;
@@ -309,9 +331,11 @@ bool batteryCharging = false;
 uint8_t batteryPercent = 0;
 uint32_t lastBatteryReadMs = 0;
 bool bluetoothEnabled=true;
+bool ridarEnabled=false;
 BLECharacteristic *statusCharacteristic = nullptr;
 BLECharacteristic *deviceNameCharacteristic = nullptr;
 String deviceNickname = BLE_DEVICE_NAME;
+String deviceEmoji;
 bool deviceStorageReady = false;
 uint32_t summaryRideSeconds = 0;
 float summaryDistanceMiles = 0.0f;
@@ -319,6 +343,7 @@ float summaryAverageMph = 0.0f;
 int summaryClimbFeet = 0;
 uint8_t summaryPage = 0;
 uint8_t statusPage = 0;
+bool odometerResetArmed = false;
 double odometerMiles = 0.0;
 double tripAMiles = 0.0;
 double tripBMiles = 0.0;
@@ -345,8 +370,15 @@ bool touchCancelConsumed = false;
 bool touchAdjustedBrightness = false;
 int16_t touchStartX = 0, touchStartY = 0, touchLastX = 0, touchLastY = 0;
 uint32_t touchStartMs = 0, touchLastMs = 0;
+bool powerSliderActive = false;
+int16_t powerSliderX = 0;
+int16_t powerSliderStartX = 0;
+bool odometerResetSliderActive = false;
+int16_t odometerResetSliderX = 0;
+int16_t odometerResetSliderStartX = 0;
 uint32_t lastTouchPollMs = 0;
 uint32_t ignoreTouchUntilMs = 0;
+bool touchBlockedUntilRelease = false;
 int16_t lastTapX = 0, lastTapY = 0;
 bool buttonWasDown = false;
 bool buttonLongHandled = false;
@@ -458,9 +490,31 @@ void applyDeviceNickname(const String &nickname, bool persist) {
   publishDeviceNickname();
 }
 
+bool validDeviceEmoji(const String &value);
+void applyDeviceEmoji(const String &emoji, bool persist);
+
 class DeviceNameCallbacks : public BLECharacteristicCallbacks {
   void onWrite(BLECharacteristic *characteristic) override {
     String requested = characteristic->getValue();
+    // Compatibility transport for phones whose bonded GATT cache predates the
+    // dedicated emoji characteristic. The leading control byte makes older
+    // firmware reject this as an invalid nickname instead of renaming itself.
+    if(requested.length()>=7 && uint8_t(requested[0])==0x1e &&
+       requested.substring(1,7)=="EMOJI:") {
+      const String emoji=requested.substring(7);
+      if(!emoji.length()) {
+        applyDeviceEmoji("",true);
+        Serial.println("Device emoji cleared via name compatibility path");
+      } else if(validDeviceEmoji(emoji)) {
+        applyDeviceEmoji(emoji,true);
+        Serial.printf("Device emoji saved via name compatibility path (%u bytes)\n",
+                      unsigned(emoji.length()));
+      } else {
+        Serial.println("Rejected malformed device emoji compatibility write");
+      }
+      publishDeviceNickname();
+      return;
+    }
     // An empty write restores the factory nickname. Non-empty input is used
     // byte-for-byte so user-visible names do not change unexpectedly.
     if (!requested.length()) {
@@ -476,6 +530,22 @@ class DeviceNameCallbacks : public BLECharacteristicCallbacks {
     applyDeviceNickname(requested, true);
   }
 };
+
+bool validDeviceEmoji(const String &value) {
+  // The phone validates this as a single grapheme. Firmware repeats the UTF-8
+  // structural checks so malformed values cannot be persisted in NVS.
+  if (!value.length() || value.length() > BLE_DEVICE_EMOJI_MAX_BYTES) return false;
+  return validDeviceNickname(value);
+}
+
+void applyDeviceEmoji(const String &emoji, bool persist) {
+  deviceEmoji = emoji;
+  if (persist && deviceStorageReady) {
+    if (deviceEmoji.isEmpty()) devicePreferences.remove("emoji");
+    else devicePreferences.putString("emoji", deviceEmoji);
+  }
+  previousDrawMs = 0;
+}
 
 bool containsIgnoreCase(const String &value, const char *needle) {
   String lower = value;
@@ -744,6 +814,9 @@ void setupBluetooth() {
   deviceNameCharacteristic->setCallbacks(new DeviceNameCallbacks());
   deviceNameCharacteristic->setValue(deviceNickname);
   gpxLibrary.begin(service->getCharacteristic(GPX_BLE_UUID), rideStorageReady);
+  sharedMap.begin(service->getCharacteristic(SHARED_MAP_BLE_UUID), rideStorageReady);
+  deviceIcon.begin(service->getCharacteristic(DEVICE_ICON_BLE_UUID),
+                   rideStorageReady);
   otaUpdate.begin(notifications.server(), FW_VERSION, otaCanStart);
   wifiConfig.begin(notifications.server());
   // Advertising must start only after every GATT service is registered. ANCS
@@ -760,21 +833,24 @@ void loadDeviceNickname() {
     Serial.println("NVS initialization failed; device nickname unavailable");
     return;
   }
-  if (!devicePreferences.isKey("nickname")) return;
-  const String stored = devicePreferences.getString("nickname", "");
-  // Migrate units that explicitly persisted the former factory name. Custom
-  // user nicknames remain untouched.
-  if (stored == LEGACY_BLE_DEVICE_NAME) {
-    devicePreferences.remove("nickname");
-    deviceNickname = BLE_DEVICE_NAME;
-    return;
+  if (devicePreferences.isKey("nickname")) {
+    const String stored = devicePreferences.getString("nickname", "");
+    // Migrate units that explicitly persisted the former factory name. Custom
+    // user nicknames remain untouched.
+    if (stored == LEGACY_BLE_DEVICE_NAME) {
+      devicePreferences.remove("nickname");
+      deviceNickname = BLE_DEVICE_NAME;
+    } else if (validDeviceNickname(stored)) {
+      deviceNickname = stored;
+    } else {
+      // Self-heal corrupt or values from incompatible development builds.
+      devicePreferences.remove("nickname");
+    }
   }
-  if (validDeviceNickname(stored)) {
-    deviceNickname = stored;
-  } else {
-    // Self-heal corrupt or values from incompatible development builds.
-    devicePreferences.remove("nickname");
-  }
+  const String storedEmoji = devicePreferences.getString("emoji", "");
+  if (!storedEmoji.length()) return;
+  if (validDeviceEmoji(storedEmoji)) deviceEmoji = storedEmoji;
+  else devicePreferences.remove("emoji");
 }
 
 void loadOdometers() {
@@ -819,6 +895,17 @@ void resetTrip(bool tripA) {
   saveOdometers();
   if (tripA) tripAMiles = 0.0;
   else tripBMiles = 0.0;
+  const OdometerRecord record = {
+      ODOMETER_MAGIC, 1, 0, odometerMiles, tripAMiles, tripBMiles};
+  odometerPreferences.putBytes("counters", &record, sizeof(record));
+}
+
+void resetOdometer() {
+  if (!odometerStorageReady) return;
+  // Commit pending distance to both trips first, then clear only the lifetime
+  // odometer. Trip A and Trip B remain independent counters.
+  saveOdometers();
+  odometerMiles = 0.0;
   const OdometerRecord record = {
       ODOMETER_MAGIC, 1, 0, odometerMiles, tripAMiles, tripBMiles};
   odometerPreferences.putBytes("counters", &record, sizeof(record));
@@ -1175,7 +1262,7 @@ void drawBluetoothIcon(int x, int y, bool enabled, bool connected) {
   const uint16_t c = !enabled ? 0x8410 :
       (connected ? BLE_CONNECTED_BLUE : RED);
   const auto is = [](float v) { return us(v * 0.52f); };
-  const int radius = max(1, is(1.6f));
+  const int radius = max(1, is(1.1f));
   const auto thickLine = [radius, c](int x1, int y1, int x2, int y2) {
     for (int dx = -radius; dx <= radius; ++dx)
       for (int dy = -radius; dy <= radius; ++dy)
@@ -1232,9 +1319,9 @@ void drawBatteryIcon(int x, int y) {
   if (batteryCharging) {
     const int cx = x;
     canvas->fillTriangle(cx + us(1), top + us(1), cx - us(4), y + us(1),
-                         cx, y + us(1), WHITE);
+                         cx, y + us(1), GREEN);
     canvas->fillTriangle(cx - us(1), y - us(1), cx + us(4), y - us(1),
-                         cx, top + height - us(1), WHITE);
+                         cx, top + height - us(1), GREEN);
   }
 }
 
@@ -1271,9 +1358,8 @@ void drawHeader(uint32_t now) {
       if (*p == 'A' || *p == 'P' || *p == 'M') *p += 'a' - 'A';
     if (text[0] == '0') memmove(text, text + 1, strlen(text));
   }
-  // Follow the round display edge while preserving a small pixel keepout.
-  // Keep a clear status icon on either side and tuck the battery directly
-  // below the clock without overlapping its glyph bounds.
+  // Status order follows the upper contour: BLE, navigation, clock, battery.
+  // The compact icons sit far enough outward to leave the clock unobstructed.
   drawBluetoothIcon(ux(68), uy(20), bluetoothEnabled, phoneConnected);
   drawNavigationIcon(ux(172), uy(20), gpsAvailable(now));
   textCentered(text, CENTER, uy(20), 3, WHITE);
@@ -1537,19 +1623,112 @@ void fillVerticalGradientRoundRect(int x, int y, int width, int height,
   }
 }
 
+void drawMushroomEmoji(int x, int y) {
+  // Compact version of the PedalOne mushroom artwork, sized to sit on the
+  // same baseline as the device nickname.
+  canvas->fillRoundRect(x-us(5),y+us(1),us(10),us(10),us(3),MUSHROOM_TAN);
+  canvas->fillEllipse(x,y-us(2),us(9),us(6),MUSHROOM_RED);
+  canvas->fillCircle(x-us(4),y-us(4),us(2),WHITE);
+  canvas->fillCircle(x+us(4),y-us(3),us(2),WHITE);
+  canvas->fillCircle(x,y-us(6),us(2),WHITE);
+}
+
+void drawClownEmoji(int x, int y) {
+  // Small native rendering of U+1F921.  The bundled fonts are ASCII-only, so
+  // use bold geometric features that remain recognizable at roughly 42 px.
+  constexpr uint16_t clownRed = 0xF986;
+  constexpr uint16_t clownBlue = 0x367F;
+  constexpr uint16_t clownFace = 0xFFDF;
+  canvas->fillCircle(x-us(8),y-us(4),us(5),clownRed);
+  canvas->fillCircle(x-us(4),y-us(8),us(5),clownRed);
+  canvas->fillCircle(x,y-us(9),us(5),clownRed);
+  canvas->fillCircle(x+us(4),y-us(8),us(5),clownRed);
+  canvas->fillCircle(x+us(8),y-us(4),us(5),clownRed);
+  canvas->fillEllipse(x,y+us(1),us(8),us(10),clownFace);
+  canvas->fillTriangle(x-us(6),y-us(4),x-us(1),y-us(5),
+                       x-us(3),y+us(1),clownBlue);
+  canvas->fillTriangle(x+us(6),y-us(4),x+us(1),y-us(5),
+                       x+us(3),y+us(1),clownBlue);
+  canvas->fillCircle(x-us(3),y-us(2),max(1,us(1)),BLACK);
+  canvas->fillCircle(x+us(3),y-us(2),max(1,us(1)),BLACK);
+  canvas->fillCircle(x,y+us(2),us(2),clownRed);
+  canvas->fillCircle(x,y+us(5),us(4),clownRed);
+  canvas->fillEllipse(x,y+us(4),us(3),us(2),clownFace);
+}
+
+void drawDeviceIdentityRow(int y) {
+  // The AMOLED font set is ASCII-only, so supported emoji are native vector
+  // art while the text itself remains strictly the nickname.
+  const bool mushroom = deviceEmoji == "\xF0\x9F\x8D\x84"; // U+1F344
+  const bool clown = deviceEmoji == "\xF0\x9F\xA4\xA1";    // U+1F921
+  const bool downloaded = deviceIcon.availableFor(deviceEmoji);
+  const bool hasIcon = downloaded || mushroom || clown;
+  const int iconWidth = downloaded ? deviceIcon.width() :
+                        (hasIcon ? us(22) : 0);
+  const int gap = hasIcon ? us(4) : 0;
+  const int maxRowWidth = us(190);
+  const GFXfont *fonts[] = {
+      &FreeSansBold24pt7b, &FreeSansBold18pt7b, &FreeSansBold12pt7b};
+  const GFXfont *chosen = fonts[2];
+  int16_t x1=0,y1=0;
+  uint16_t width=0,height=0;
+  for (const GFXfont *font : fonts) {
+    canvas->setFont(font);
+    canvas->setTextSize(1);
+    canvas->getTextBounds(deviceNickname.c_str(),0,0,&x1,&y1,&width,&height);
+    chosen=font;
+    if (int(width)+iconWidth+gap<=maxRowWidth) break;
+  }
+  canvas->setFont(chosen);
+  canvas->getTextBounds(deviceNickname.c_str(),0,0,&x1,&y1,&width,&height);
+  const int totalWidth=iconWidth+gap+int(width);
+  const int startX=CENTER-totalWidth/2;
+  if(downloaded)
+    canvas->draw16bitRGBBitmap(startX,y-deviceIcon.height()/2,
+                              deviceIcon.pixels(),deviceIcon.width(),
+                              deviceIcon.height());
+  else if(mushroom)drawMushroomEmoji(startX+iconWidth/2,y);
+  else if(clown)drawClownEmoji(startX+iconWidth/2,y);
+  canvas->setTextColor(WHITE);
+  canvas->setCursor(startX+iconWidth+gap-x1,y-(y1+int(height)/2));
+  canvas->print(deviceNickname);
+}
+
+void textCenteredScaledToWidth(const char *text,int x,int y,int maxWidth,
+                               uint8_t maxScale,uint16_t color) {
+  canvas->setFont(&FreeSansBold24pt7b);
+  uint8_t scale=maxScale;
+  int16_t x1,y1;
+  uint16_t width,height;
+  while(scale>1) {
+    canvas->setTextSize(scale);
+    canvas->getTextBounds(text,0,0,&x1,&y1,&width,&height);
+    if(width<=maxWidth)break;
+    --scale;
+  }
+  canvas->setTextSize(scale);
+  canvas->setTextColor(color);
+  canvas->getTextBounds(text,0,0,&x1,&y1,&width,&height);
+  canvas->setCursor(x-(x1+int(width)/2),y-(y1+int(height)/2));
+  canvas->print(text);
+  canvas->setTextSize(1);
+}
+
 void drawReadyScreen(uint32_t now) {
   beginFrame();
   drawHeader(now);
+  const bool gpsReady=gpsAvailable(now);
   if (onboardGpsPresent) {
-    const bool acquired = onboardGps.fixFresh(now);
-    textCentered(acquired ? "GPS Acquired" : "Acquiring GPS...",
-                 CENTER, uy(55), 2, acquired ? GREEN : YELLOW);
-    textCenteredScaled("Let's", CENTER, uy(105), 2, WHITE);
-    textCenteredScaled("Go!", CENTER, uy(163), 2, WHITE);
+    textCentered(gpsReady ? "GPS Acquired" : "Acquiring GPS...",
+                 CENTER,uy(57),2,gpsReady ? GREEN : YELLOW);
   } else {
-    textCenteredScaled("Let's", CENTER, uy(88), 2, WHITE);
-    textCenteredScaled("Go!", CENTER, uy(151), 2, WHITE);
+    textCentered(gpsReady ? "GPS via Phone" : "Waiting for GPS...",
+                 CENTER,uy(57),2,gpsReady ? GREEN : YELLOW);
   }
+  drawDeviceIdentityRow(uy(84));
+  // Place the top of the large call-to-action just below the display's
+  // horizontal midpoint, leaving clear separation from the bike identity.
+  textCenteredScaledToWidth("Let's Go!",CENTER,uy(146),us(216),2,WHITE);
   const float phase = (now % 1000) / 1000.0f;
   const float bounce = 4.0f * phase * (1.0f - phase);
   canvas->fillCircle(CENTER, uy(224 - int(bounce * 25)), us(7), CYAN);
@@ -1557,7 +1736,6 @@ void drawReadyScreen(uint32_t now) {
 }
 
 void drawMenu(uint32_t now) {
-  static const char *optionItems[] = {"Status", "Bluetooth", "Brightness", "Odometer", "Rides", "Routes", "OFF"};
   const bool ride = appState == RIDE_MENU;
   beginFrame();
   drawHeader(now);
@@ -1607,17 +1785,42 @@ void drawMenu(uint32_t now) {
     endFrame();
     return;
   }
-  const char **items = optionItems;
-  const int count = 7;
-  for (int i = 0; i < count; ++i) {
-    const bool selected = i == menuSelection;
-    const int y = 49 + i * 26;
-    if(i==6) {
-      for(int inset=0;inset<us(2);++inset)
-        canvas->drawRect(ux(85)+inset,uy(y-13)+inset,us(70)-2*inset,us(27)-2*inset,RED);
-    }
-    textCentered(items[i], CENTER, uy(y), selected ? 4 : 3, WHITE);
-  }
+  // Removing the old title leaves room for the RiDar control without making
+  // the shutdown slider any smaller. These centers are mirrored by activate().
+  textCentered("Status", ux(72), uy(50), 4, WHITE);
+  textCentered("Routes", ux(168), uy(50), 4, WHITE);
+  textCentered("Bluetooth", ux(72), uy(83), 4, WHITE);
+  textCentered("History", ux(168), uy(83), 4, WHITE);
+  textCentered("Display", ux(72), uy(116), 4, WHITE);
+  textCentered("Odometer", ux(168), uy(116), 4, WHITE);
+
+  textCentered("RiDar", ux(72), uy(151), 4, WHITE);
+  const int ridarLeft=ux(130),ridarTop=uy(134),ridarWidth=us(76),ridarHeight=us(34);
+  fillVerticalGradientRoundRect(ridarLeft,ridarTop,ridarWidth,ridarHeight,
+                                ridarHeight/2,
+                                ridarEnabled ? GREEN : 0x630C,
+                                ridarEnabled ? interpolateRgb565(GREEN,BLACK,0.42f) : 0x3186);
+  const int ridarKnobX=ridarEnabled ? ux(188) : ux(148);
+  canvas->fillCircle(ridarKnobX,uy(151),us(14),WHITE);
+  textCentered(ridarEnabled ? "ON" : "OFF",
+               ridarEnabled ? ux(151) : ux(183),uy(151),2,WHITE);
+
+  // Deliberate slide-to-off control. A tap cannot accidentally shut down.
+  const int sliderLeft = ux(71);
+  const int sliderTop = uy(185);
+  const int sliderWidth = us(98);
+  const int sliderHeight = us(38);
+  const int knobRadius = us(16);
+  const int knobMin = ux(90);
+  const int knobMax = ux(150);
+  const int knobX = powerSliderActive
+      ? constrain(int(powerSliderX), knobMin, knobMax) : knobMin;
+  fillVerticalGradientRoundRect(sliderLeft, sliderTop, sliderWidth,
+                                sliderHeight, sliderHeight / 2,
+                                0xAD55, 0x738E);
+  canvas->fillCircle(knobX, uy(204), knobRadius, 0xF920);
+  canvas->fillCircle(knobX - us(3), uy(200), us(5), 0xFAE8);
+  textCentered("OFF", ux(139), uy(204), 4, WHITE);
   endFrame();
 }
 
@@ -1791,17 +1994,20 @@ void drawStatus(uint32_t now) {
     textCentered(line, CENTER, uy(180), 3, WHITE);
   } else {
     drawHeader(now);
-    textCentered("DISTANCE", CENTER, uy(70), 4, WHITE);
+    textCentered("DISTANCE", CENTER, uy(57), 4, WHITE);
     snprintf(line, sizeof(line), "ODO  %.1f mi", odometerMiles + odometerPendingMiles);
-    textCentered(line, CENTER, uy(108), 3, WHITE);
+    textCentered(line, CENTER, uy(85), 3, WHITE);
+
     snprintf(line, sizeof(line), "TRIP A  %.1f mi", tripAMiles + tripAPendingMiles);
-    textCentered(line, CENTER, uy(140), 3, WHITE);
+    canvas->drawRoundRect(ux(25), uy(103), us(190), us(31), us(7), 0x4208);
+    textCentered(line, CENTER, uy(119), 3, WHITE);
+
     snprintf(line, sizeof(line), "TRIP B  %.1f mi", tripBMiles + tripBPendingMiles);
-    textCentered(line, CENTER, uy(172), 3, WHITE);
-    canvas->drawRoundRect(ux(31), uy(190), us(82), us(29), us(6), WHITE);
-    canvas->drawRoundRect(ux(127), uy(190), us(82), us(29), us(6), WHITE);
-    textCentered("RESET A", ux(72), uy(205), 1, WHITE);
-    textCentered("RESET B", ux(168), uy(205), 1, WHITE);
+    canvas->drawRoundRect(ux(25), uy(138), us(190), us(31), us(7), 0x4208);
+    textCentered(line, CENTER, uy(154), 3, WHITE);
+
+    canvas->drawRoundRect(ux(68), uy(188), us(104), us(36), us(9), RED);
+    textCentered("RESET ODO", CENTER, uy(206), 2, WHITE);
   }
   endFrame();
 }
@@ -1829,6 +2035,49 @@ void drawOtaUpdate(uint32_t now) {
 void drawConfirmation(uint32_t now) {
   beginFrame();
   drawHeader(now);
+  if (pendingAction == ACTION_RESET_ODOMETER) {
+    canvas->fillRoundRect(ux(25), uy(55), us(190), us(145), us(10), 0x1082);
+    canvas->drawRoundRect(ux(25), uy(55), us(190), us(145), us(10), WHITE);
+    if (!odometerResetArmed) {
+      textCentered("RESET ODO?", CENTER, uy(88), 4, WHITE);
+      textCentered("Are you sure?", CENTER, uy(120), 2, WHITE);
+      canvas->fillRoundRect(ux(84), uy(148), us(72), us(34), us(7), GREEN);
+      textCentered("OK", CENTER, uy(165), 4, BLACK);
+    } else {
+      textCentered("RESET ODO", CENTER, uy(86), 4, WHITE);
+      textCentered("Slide to reset", CENTER, uy(112), 1, WHITE);
+      const int sliderLeft = ux(55);
+      const int sliderTop = uy(130);
+      const int sliderWidth = us(130);
+      const int sliderHeight = us(42);
+      const int knobMin = ux(77);
+      const int knobMax = ux(163);
+      const int knobX = odometerResetSliderActive
+          ? constrain(int(odometerResetSliderX), knobMin, knobMax) : knobMin;
+      fillVerticalGradientRoundRect(sliderLeft, sliderTop, sliderWidth,
+                                    sliderHeight, sliderHeight / 2,
+                                    0x8410, 0x4208);
+      textCentered("RESET", ux(135), uy(151), 2, WHITE);
+      canvas->fillCircle(knobX, uy(151), us(18), RED);
+      canvas->fillCircle(knobX - us(3), uy(147), us(5), 0xFAE8);
+    }
+    textCentered("Tap outside to cancel", CENTER, uy(190), 1, WHITE);
+    endFrame();
+    return;
+  }
+  if (pendingAction == ACTION_RESET_TRIP_A ||
+      pendingAction == ACTION_RESET_TRIP_B) {
+    canvas->fillRoundRect(ux(25), uy(55), us(190), us(135), us(10), 0x1082);
+    canvas->drawRoundRect(ux(25), uy(55), us(190), us(135), us(10), WHITE);
+    textCentered(pendingAction == ACTION_RESET_TRIP_A
+                     ? "RESET TRIP A?" : "RESET TRIP B?",
+                 CENTER, uy(93), 4, WHITE);
+    canvas->fillRoundRect(ux(84), uy(132), us(72), us(36), us(7), GREEN);
+    textCentered("OK", CENTER, uy(150), 4, BLACK);
+    textCentered("Tap outside to cancel", CENTER, uy(180), 1, WHITE);
+    endFrame();
+    return;
+  }
   canvas->fillRoundRect(ux(25), uy(55), us(190), us(130), us(10), 0x1082);
   canvas->drawRoundRect(ux(25), uy(55), us(190), us(130), us(10), WHITE);
   const char *question = pendingAction == ACTION_END_RIDE ? "END RIDE?" :
@@ -1868,19 +2117,59 @@ void drawDisplayPage(uint32_t now) {
 }
 
 void drawCountdown(uint32_t now) {
-  const uint32_t elapsed = now - countdownStartMs;
+  const uint32_t elapsed = min(uint32_t(3000), now - countdownStartMs);
   const int number = max(1, 3 - int(elapsed / 1000));
-  const float progress = (elapsed % 1000) / 1000.0f;
+  const float remaining = 1.0f - elapsed / 3000.0f;
+  const float sweep = 359.0f * remaining;
+  // Push the countdown almost to the round panel's edge, while reserving the
+  // narrow lower crescent for the cancel hint.
+  const int centerY = uy(107);
+  const int outerRadius = us(107);
+  const int innerRadius = us(94);
+  const int middleRadius = (outerRadius + innerRadius) / 2;
+  const int capRadius = max(2, (outerRadius - innerRadius) / 2);
+  constexpr uint16_t countdownTrack = 0x0300;
+
   beginFrame();
-  canvas->drawArc(CENTER, CENTER, us(119), us(110), 0,
-                  max(2, int(359 * (1.0f - progress))), START_GREEN);
-  drawHeader(now);
-  textCentered("Starting in", CENTER, uy(82), 5, START_GREEN);
+  canvas->fillArc(CENTER, centerY, outerRadius, innerRadius,
+                  0.0f, 359.0f, countdownTrack);
+
+  // Anchor the contracting arc at twelve o'clock. Rounded caps closely match
+  // the reference and leave a single bright dot as the countdown reaches 1.
+  const float startAngle = 270.0f;
+  if (sweep > 0.5f)
+    canvas->fillArc(CENTER, centerY, outerRadius, innerRadius,
+                    startAngle, startAngle + sweep, START_GREEN);
+  const float endRadians = (startAngle + sweep) * PI / 180.0f;
+  canvas->fillCircle(CENTER, centerY - middleRadius, capRadius, START_GREEN);
+  if (sweep > 0.5f)
+    canvas->fillCircle(CENTER + lroundf(cosf(endRadians) * middleRadius),
+                       centerY + lroundf(sinf(endRadians) * middleRadius),
+                       capRadius, START_GREEN);
+
   char text[4];
   snprintf(text, sizeof(text), "%d", number);
-  textCenteredNumeric(text, CENTER, uy(165), START_GREEN);
-  textCentered("Hold 2 sec to cancel", CENTER, uy(215), 2, WHITE);
+  canvas->setFont(&Arial_Bold92pt7b);
+  canvas->setTextSize(1);
+  canvas->setTextColor(WHITE);
+  int16_t x1 = 0, y1 = 0;
+  uint16_t width = 0, height = 0;
+  canvas->getTextBounds(text, 0, 0, &x1, &y1, &width, &height);
+  canvas->setCursor(CENTER - (x1 + int(width) / 2),
+                    centerY - (y1 + int(height) / 2));
+  canvas->print(text);
+  textCentered("2s press to cancel", CENTER, uy(229), 1, WHITE);
   endAnimatedFrame();
+}
+
+void drawRideCanceled(uint32_t now) {
+  beginFrame();
+  drawHeader(now);
+  textCentered("RIDE",CENTER,uy(91),5,WHITE);
+  textCentered("CANCELED",CENTER,uy(126),5,WHITE);
+  canvas->fillRoundRect(ux(76),uy(166),us(88),us(42),us(9),GREEN);
+  textCentered("OK",CENTER,uy(187),4,BLACK);
+  endFrame();
 }
 
 uint16_t gradeColor(float grade) {
@@ -2172,10 +2461,20 @@ void drawPausedBadge() {
   textCentered("PAUSED", CENTER, uy(61), 2, YELLOW);
 }
 
+#include "shared_map_display.inc"
 #include "gpx_display.inc"
+#include "pq_map_display.inc"
 
 void drawRidePage(uint32_t now) {
-  if (currentPage == gpx::PAGE_INDEX) { drawLiveGpxPage(now); return; }
+  if (currentPage == gpx::PAGE_INDEX) {
+    if (routeNavigationEnabled) drawLiveGpxPage(now);
+    else drawFreeRideMapPage(now);
+    return;
+  }
+  if (currentPage == RIDAR_PAGE_INDEX) {
+    drawRidarPage(now);
+    return;
+  }
   const uint32_t seconds = activeRideElapsedMs(now) / 1000;
   beginFrame();
   drawGradeRing(now);
@@ -2205,6 +2504,18 @@ void drawRidePage(uint32_t now) {
   drawRidePageDots();
   drawPausedBadge();
   endAnimatedFrame();
+}
+
+uint32_t rideFrameIntervalMs() {
+  if (ridePaused) return 1000;
+  if (currentPage == RIDAR_PAGE_INDEX)
+    return ridarMapZoomAnimating ? 83 : 500;
+  if (currentPage == gpx::PAGE_INDEX)
+    return routeNavigationEnabled ? gpxMapFrameIntervalMs()
+                                  : freeRideMapFrameIntervalMs();
+  if (currentPage == 0)
+    return currentSpeedMph > 0.5f ? 125 : 500;
+  return currentSpeedMph > 0.5f ? 250 : 1000;
 }
 
 void loadSummaryRoute() {
@@ -2383,7 +2694,22 @@ void wakeDisplay(uint32_t now) {
 }
 
 void openMenu() { appState = MENU; menuSelection = 0; previousDrawMs = 0; }
-void openOptionsMenu() { appState = OPTIONS_MENU; menuSelection = 0; previousDrawMs = 0; }
+void openHome() {
+  appState = READY;
+  menuSelection = 0;
+  ridesEditMode = false;
+  routeSelectionForStart = false;
+  powerSliderActive = false;
+  powerSliderX = ux(90);
+  previousDrawMs = 0;
+}
+void openOptionsMenu() {
+  appState = OPTIONS_MENU;
+  menuSelection = 0;
+  powerSliderActive = false;
+  powerSliderX = ux(90);
+  previousDrawMs = 0;
+}
 void openRideMenu() { appState = RIDE_MENU; menuSelection = 0; previousDrawMs = 0; }
 void openDisplayPage(uint32_t now, AppState returnState = RIDE_MENU) {
   displayReturnState = returnState;
@@ -2391,7 +2717,19 @@ void openDisplayPage(uint32_t now, AppState returnState = RIDE_MENU) {
   wakeDisplay(now);
   previousDrawMs = 0;
 }
-void startCountdown(uint32_t now) { appState = COUNTDOWN; countdownStartMs = now; previousDrawMs = 0; }
+void startCountdown(uint32_t now) {
+  appState = COUNTDOWN;
+  countdownStartMs = now;
+  previousDrawMs = 0;
+  // The tap (or multi-touch hold) that selected the ride can remain reported
+  // by the CST9217 after the destination screen appears.  Never let that old
+  // contact become the countdown's two-second cancel hold: first require a
+  // completely released frame, then pollTouch() applies its bounce lockout.
+  touchActive = false;
+  demoStartHoldActive = false;
+  touchBlockedUntilRelease = true;
+  ignoreTouchUntilMs = 0;
+}
 
 uint32_t activeRideElapsedMs(uint32_t now) {
   uint32_t elapsed = now - rideStartMs;
@@ -2614,7 +2952,7 @@ void startRide(uint32_t now) {
   gpsSamplesSinceFlush = 0;
   nextGpsSampleMs = now;
   if (activeGpsFile) activeGpsFile.close();
-  if (rideStorageReady) {
+  if (!demoRideActive && rideStorageReady) {
     FFat.remove(ACTIVE_GPS_PATH);
     activeGpsFile = FFat.open(ACTIVE_GPS_PATH, FILE_WRITE);
   }
@@ -2627,10 +2965,111 @@ void startRide(uint32_t now) {
   portEXIT_CRITICAL(&locationMux);
   rideStartMs = ridePreviousMs = now; stationarySinceMs = 0; zeroSpeedSinceMs = now;
   displayAutoDimmed = false; display->setBrightness(normalBrightness);
-  previousDrawMs = 0; notifyPhone("riding");
+  previousDrawMs = 0;
+  if (!demoRideActive) notifyPhone("riding");
+}
+
+bool startDemoRide(uint32_t now) {
+  demoPreviousRouteId = gpxLibrary.selectedID;
+  if (!gpxLibrary.select(PQ_LOOP_ROUTE_ID, false)) {
+    Serial.println("Demo start failed: PQ Loop route unavailable");
+    return false;
+  }
+  demoRideActive = true;
+  demoRouteMeters = 0.0f;
+  demoTargetSpeedMph = 14.0f;
+  demoNextSpeedTargetMs = now + 5000;
+  demoRandomState ^= now | 1u;
+  routeSelectionForStart = false;
+  routeNavigationEnabled = true;
+  startRide(now);
+  currentSpeedMph = 12.0f;
+  lastActivityMs = now;
+  Serial.println("PQ Loop demo ride started");
+  return true;
+}
+
+void stopDemoRide() {
+  demoRideActive = false;
+  demoStartHoldActive = false;
+  currentSpeedMph = 0.0f;
+  routeNavigationEnabled = false;
+  if (demoPreviousRouteId && demoPreviousRouteId != gpxLibrary.selectedID)
+    gpxLibrary.select(demoPreviousRouteId, false);
+  demoPreviousRouteId = 0;
+  portENTER_CRITICAL(&locationMux);
+  hasLocation = false;
+  lastLocationMs = 0;
+  portEXIT_CRITICAL(&locationMux);
+  openHome();
+}
+
+void updateDemoRideData(uint32_t now) {
+  const float deltaSeconds = min(0.25f, (now - ridePreviousMs) * 0.001f);
+  ridePreviousMs = now;
+  if (ridePaused) {
+    currentSpeedMph = 0.0f;
+    liveGradeValid = false;
+    gradeMotionActive = false;
+    return;
+  }
+
+  if (demoRouteMeters >= gpx::length()) {
+    currentSpeedMph = 0.0f;
+    gpxArrived = true;
+  } else {
+    if (int32_t(now - demoNextSpeedTargetMs) >= 0) {
+      // Xorshift gives deterministic, inexpensive target changes. A long
+      // low-pass transition turns those targets into natural speed drift.
+      demoRandomState ^= demoRandomState << 13;
+      demoRandomState ^= demoRandomState >> 17;
+      demoRandomState ^= demoRandomState << 5;
+      demoTargetSpeedMph = 8.0f + (demoRandomState % 1401) * 0.01f;
+      demoNextSpeedTargetMs = now + 4500 + (demoRandomState % 5000);
+    }
+    const float alpha = 1.0f - expf(-deltaSeconds / 3.5f);
+    currentSpeedMph += alpha * (demoTargetSpeedMph - currentSpeedMph);
+    currentSpeedMph = constrain(currentSpeedMph, 8.0f, 22.0f);
+    demoRouteMeters = min(gpx::length(), demoRouteMeters +
+        currentSpeedMph * 0.44704f * deltaSeconds);
+  }
+
+  const auto position = gpx::sample(demoRouteMeters);
+  const float course = gpx::heading(demoRouteMeters);
+  float courseDegrees = fmodf(course * 180.0f / PI + 360.0f, 360.0f);
+  const time_t wallClock = time(nullptr);
+  LocationPacket packet = {};
+  packet.version = 1;
+  packet.sequence = uint16_t(now / 200);
+  packet.timestamp = wallClock > 1700000000 ? uint32_t(wallClock) : 0;
+  packet.latitudeE7 = lround((gpx::lat0 +
+      position.north / (gpx::RAD * gpx::EARTH)) * 1.0e7);
+  packet.longitudeE7 = lround((gpx::lon0 +
+      position.east / (gpx::RAD * gpx::EARTH * gpx::lonScale)) * 1.0e7);
+  packet.speedCms = uint16_t(lroundf(currentSpeedMph / 0.02236936f));
+  packet.courseDeg100 = uint16_t(lroundf(courseDegrees * 100.0f)) % 36000;
+  packet.accuracyCm = 100;
+  packet.flags = (1 << 0) | (1 << 2);  // Valid speed and course.
+  portENTER_CRITICAL(&locationMux);
+  latestLocation = packet;
+  lastLocationMs = now;
+  hasLocation = true;
+  portEXIT_CRITICAL(&locationMux);
+
+  distanceMiles = demoRouteMeters / 1609.344f;
+  const float elapsedHours = activeRideElapsedMs(now) / 3600000.0f;
+  averageSpeedMph = elapsedHours > 0.0f ? distanceMiles / elapsedHours : 0.0f;
+  rideMaxSpeedMph = max(rideMaxSpeedMph, currentSpeedMph);
+  liveGradeValid = false;
+  gradeMotionActive = false;
+  lastActivityMs = now;
 }
 
 void prepareRideEnd(uint32_t now) {
+  if (demoRideActive) {
+    stopDemoRide();
+    return;
+  }
   finishRidePause(now);
   accumulateMinuteAverages(now);
   storeMinuteAverage();  // Keep the final partial minute for short rides.
@@ -2661,6 +3100,10 @@ void completeRideEnd(bool saveRide) {
 }
 
 void updateRideData(uint32_t now) {
+  if (demoRideActive) {
+    updateDemoRideData(now);
+    return;
+  }
   if (ridePaused) {
     ridePreviousMs = now;
     currentSpeedMph = 0.0f;
@@ -2849,6 +3292,27 @@ void updateAutoBrightness(uint32_t now) {
 }
 
 Gesture pollTouch(uint32_t now) {
+  // A countdown-cancel hold must end completely before the confirmation can
+  // accept input. Once released, add a quiet window for controller bounce.
+  if(touchBlockedUntilRelease) {
+    const bool shouldPoll=touchPending || touchActive ||
+        now-lastTouchPollMs>=TOUCH_POLL_MS;
+    if(shouldPoll) {
+      if(touchPending) {
+        noInterrupts();touchPending=false;interrupts();
+      }
+      lastTouchPollMs=now;
+      int16_t ignoredX[2],ignoredY[2];
+      const uint8_t points=touch.getPoint(ignoredX,ignoredY,2);
+      if(!points) {
+        touchBlockedUntilRelease=false;
+        touchActive=false;
+        demoStartHoldActive=false;
+        ignoreTouchUntilMs=now+COUNTDOWN_CANCEL_TOUCH_LOCKOUT_MS;
+      }
+    }
+    return GESTURE_NONE;
+  }
   // Some CST9217 releases produce a second short contact report after a menu
   // tap. Consume those reports without blocking animation or BLE work.
   if (int32_t(ignoreTouchUntilMs - now) > 0) {
@@ -2860,6 +3324,9 @@ Gesture pollTouch(uint32_t now) {
       touch.getPoint(ignoredX, ignoredY, 2);
     }
     touchActive = false;
+    powerSliderActive = false;
+    odometerResetSliderActive = false;
+    demoStartHoldActive = false;
     return GESTURE_NONE;
   }
   const bool periodicPoll = touchActive && now - lastTouchPollMs >= TOUCH_POLL_MS;
@@ -2878,14 +3345,66 @@ Gesture pollTouch(uint32_t now) {
         x[i] = y[i];
         y[i] = SCREEN_SIZE - 1 - unrotatedX;
       }
+      if (appState == START_ROUTE_MENU && points >= 2) {
+        const bool point0InColumn = x[0] >= ux(26) && x[0] <= ux(214);
+        const bool point1InColumn = x[1] >= ux(26) && x[1] <= ux(214);
+        const bool point0Gpx = point0InColumn && y[0] >= uy(75) && y[0] <= uy(133);
+        const bool point1Gpx = point1InColumn && y[1] >= uy(75) && y[1] <= uy(133);
+        const bool point0Free = point0InColumn && y[0] >= uy(137) && y[0] <= uy(195);
+        const bool point1Free = point1InColumn && y[1] >= uy(137) && y[1] <= uy(195);
+        const bool bothChoices = (point0Gpx && point1Free) ||
+                                 (point1Gpx && point0Free);
+        if (bothChoices) {
+          if (!demoStartHoldActive) {
+            demoStartHoldActive = true;
+            demoStartHoldMs = now;
+          } else if (now - demoStartHoldMs >= 2000) {
+            demoStartHoldActive = false;
+            touchActive = false;
+            touchBlockedUntilRelease = true;
+            previousDrawMs = 0;
+            return GESTURE_START_DEMO;
+          }
+        } else {
+          demoStartHoldActive = false;
+        }
+      } else {
+        demoStartHoldActive = false;
+      }
       // A touch wakes the panel immediately; no completed swipe is required.
       wakeDisplay(now);
       if (!touchActive) {
         touchActive = true; touchStartX = touchLastX = x[0];
         touchStartY = touchLastY = y[0]; touchStartMs = now;
         touchAdjustedBrightness = false;
+        if (appState == OPTIONS_MENU &&
+            x[0] >= ux(63) && x[0] <= ux(112) &&
+            y[0] >= uy(176) && y[0] <= uy(232)) {
+          powerSliderActive = true;
+          powerSliderStartX = x[0];
+          powerSliderX = x[0];
+          previousDrawMs = 0;
+        }
+        if (appState == CONFIRM_PAGE &&
+            pendingAction == ACTION_RESET_ODOMETER && odometerResetArmed &&
+            x[0] >= ux(48) && x[0] <= ux(106) &&
+            y[0] >= uy(116) && y[0] <= uy(184)) {
+          odometerResetSliderActive = true;
+          odometerResetSliderStartX = x[0];
+          odometerResetSliderX = x[0];
+          previousDrawMs = 0;
+        }
       } else { touchLastX = x[0]; touchLastY = y[0]; }
       touchLastMs = now;
+
+      if (powerSliderActive) {
+        powerSliderX = x[0];
+        previousDrawMs = 0;
+      }
+      if (odometerResetSliderActive) {
+        odometerResetSliderX = x[0];
+        previousDrawMs = 0;
+      }
 
       // The brightness bar is a direct-manipulation control.  Its enlarged
       // vertical hit area makes it easy to use while riding or wearing gloves.
@@ -2900,10 +3419,45 @@ Gesture pollTouch(uint32_t now) {
         previousDrawMs = 0;
         touchAdjustedBrightness = true;
       }
-    } else if (touchActive) touchLastMs = now - TOUCH_RELEASE_MS;
+    } else if (touchActive) {
+      demoStartHoldActive = false;
+      touchLastMs = now - TOUCH_RELEASE_MS;
+    }
   }
   if (!touchActive || now - touchLastMs < TOUCH_RELEASE_MS) return GESTURE_NONE;
   touchActive = false;
+  if (powerSliderActive) {
+    const int sliderDx = touchLastX - touchStartX;
+    const int sliderDy = touchLastY - touchStartY;
+    // A bottom-edge upward flick remains the universal Back gesture even
+    // when it begins on the slide-to-off thumb.
+    if (sliderDy <= -SWIPE_THRESHOLD &&
+        abs(sliderDx) <= SWIPE_VERTICAL_LIMIT) {
+      powerSliderActive = false;
+      previousDrawMs = 0;
+      return GESTURE_UP;
+    }
+    const bool completed = powerSliderX >= ux(145) &&
+                           powerSliderX - powerSliderStartX >= us(42);
+    powerSliderActive = false;
+    previousDrawMs = 0;
+    return completed ? GESTURE_POWER_OFF : GESTURE_NONE;
+  }
+  if (odometerResetSliderActive) {
+    const int sliderDx = touchLastX - touchStartX;
+    const int sliderDy = touchLastY - touchStartY;
+    if (sliderDy <= -SWIPE_THRESHOLD &&
+        abs(sliderDx) <= SWIPE_VERTICAL_LIMIT) {
+      odometerResetSliderActive = false;
+      previousDrawMs = 0;
+      return GESTURE_UP;
+    }
+    const bool completed = odometerResetSliderX >= ux(158) &&
+                           odometerResetSliderX - odometerResetSliderStartX >= us(60);
+    odometerResetSliderActive = false;
+    previousDrawMs = 0;
+    return completed ? GESTURE_ODOMETER_RESET : GESTURE_NONE;
+  }
   if (touchCancelConsumed) {
     touchCancelConsumed=false;
     return GESTURE_NONE;
@@ -2914,8 +3468,14 @@ Gesture pollTouch(uint32_t now) {
   }
   const int dx = touchLastX - touchStartX;
   const int dy = touchLastY - touchStartY;
-  if (touchStartY >= SCREEN_SIZE * 55 / 100 && dy <= -SWIPE_THRESHOLD &&
-      abs(dx) <= SWIPE_VERTICAL_LIMIT)
+  // The completed-ride screens must be easy to leave from any page. Accept a
+  // shorter and more diagonal upward flick here than the generic navigation
+  // threshold, then let the main state handler return to Home/Rides.
+  if (appState == SUMMARY && dy <= -us(14) && abs(dx) <= us(105))
+    return GESTURE_UP;
+  // Back must be available from the whole round display, not only when the
+  // gesture starts in the lower 45 percent.
+  if (dy <= -SWIPE_THRESHOLD && abs(dx) <= SWIPE_VERTICAL_LIMIT)
     return GESTURE_UP;
   const int horizontalThreshold = appState == ANCS_TEST ? 24 : SWIPE_THRESHOLD;
   if (abs(dx) >= horizontalThreshold && abs(dy) <= SWIPE_VERTICAL_LIMIT)
@@ -2923,7 +3483,20 @@ Gesture pollTouch(uint32_t now) {
   if (abs(dx) < 30 && abs(dy) < 30 && now - touchStartMs < LONG_PRESS_MS) {
     lastTapX = touchLastX;
     lastTapY = touchLastY;
-    if(appState==RIDING && (gpxPageAlert.active || gpxTurnPreview.active))return GESTURE_TAP;
+    // An automatic GPX preview used to claim every tap before the side-page
+    // zones were checked. That made left/right taps dismiss first and change
+    // pages only on a second touch. Preserve center-tap dismissal, but let a
+    // side tap advance immediately; the main loop already closes the preview
+    // before changing pages for these two gestures.
+    if (appState == RIDING && (gpxPageAlert.active || gpxTurnPreview.active)) {
+      if (lastTapX < SCREEN_SIZE / 3) return GESTURE_RIGHT;
+      if (lastTapX >= SCREEN_SIZE * 2 / 3) return GESTURE_LEFT;
+      return GESTURE_TAP;
+    }
+    // Free Ride zoom occupies the right third, which is normally the next-page
+    // tap zone. Claim these two large controls before page navigation.
+    if(appState==RIDING && !routeNavigationEnabled && currentPage==gpx::PAGE_INDEX &&
+       freeRideMapZoomControl(lastTapX,lastTapY))return GESTURE_TAP;
     // During a ride, reserve a generous strip along the bottom edge for the
     // menu. Check it before the left/right page zones so the corner portions
     // of the strip behave consistently too.
@@ -3200,14 +3773,14 @@ void drawPedalOneSplashFrame(uint32_t elapsed) {
   endAnimatedFrame();
 }
 
-void showPedalOneStartupSplash() {
+uint32_t showPedalOneStartupSplashIntro() {
   constexpr uint32_t frameIntervalMs = 33;  // Approximately 30 FPS.
   const uint32_t started = millis();
   uint32_t nextFrame = started;
   while (true) {
     const uint32_t now = millis();
     const uint32_t elapsed = now - started;
-    if (elapsed >= SPLASH_END_MS) break;
+    if (elapsed >= SPLASH_TEXT_COMPLETE_MS) break;
     if (int32_t(now - nextFrame) < 0) {
       delay(nextFrame - now);
       continue;
@@ -3216,8 +3789,36 @@ void showPedalOneStartupSplash() {
     nextFrame += frameIntervalMs;
     if (int32_t(now - nextFrame) >= 0) nextFrame = now + 1;
   }
-  // Guarantee the exact completed logo remains on-screen for the last frame.
-  drawPedalOneSplashFrame(SPLASH_END_MS);
+  // Leave the complete logo on the panel while the remaining peripherals and
+  // BLE services initialize. The framebuffer remains visible without redraws.
+  drawPedalOneSplashFrame(SPLASH_TEXT_COMPLETE_MS);
+  return millis();
+}
+
+void finishPedalOneStartupSplash(uint32_t logoReadyMs) {
+  constexpr uint32_t frameIntervalMs = 33;  // Approximately 30 FPS.
+  constexpr uint32_t holdMs = SPLASH_HOLD_END_MS - SPLASH_TEXT_COMPLETE_MS;
+  while (millis() - logoReadyMs < holdMs) delay(5);
+
+  const uint32_t exitStarted = millis();
+  uint32_t nextFrame = exitStarted;
+  while (true) {
+    const uint32_t now = millis();
+    const uint32_t exitElapsed = now - exitStarted;
+    if (exitElapsed >= SPLASH_END_MS - SPLASH_HOLD_END_MS) break;
+    if (int32_t(now - nextFrame) < 0) {
+      delay(nextFrame - now);
+      continue;
+    }
+    drawPedalOneSplashFrame(SPLASH_HOLD_END_MS + exitElapsed);
+    nextFrame += frameIntervalMs;
+    if (int32_t(now - nextFrame) >= 0) nextFrame = now + 1;
+  }
+}
+
+void showPedalOneStartupSplash() {
+  const uint32_t logoReadyMs = showPedalOneStartupSplashIntro();
+  finishPedalOneStartupSplash(logoReadyMs);
 }
 
 void showShutdownSplash() { showBrandSplash("BYO", 1000); }
@@ -3320,6 +3921,7 @@ void shutDownAfterTimerBoot() {
 
 void enterDeepSleep(bool manualShutdown = false) {
   wifiConfig.stop();
+  riderNetwork.pause();
   saveOdometers();
   if (activeGpsFile) {
     activeGpsFile.flush();
@@ -3358,6 +3960,7 @@ void enterLowPowerSleep(bool manualShutdown = false) {
 
 void enterInactiveSleep() {
   wifiConfig.stop();
+  riderNetwork.pause();
   // During an active ride, retain RAM and the open GPS log so the same ride
   // can continue after touch wake. NimBLE must be stopped before manual light
   // sleep; otherwise ESP-IDF may reject sleep and return immediately.
@@ -3452,6 +4055,10 @@ void enterInactiveSleep() {
 
 void moveSelection(int direction, uint32_t now) {
   wakeDisplay(now);
+  // CST9217 can report a short second contact after release. Without the
+  // lockout, that ghost tap advances another page and makes the first target
+  // page look as though it was skipped.
+  ignoreTouchUntilMs = now + PAGE_TOUCH_LOCKOUT_MS;
   if (appState == RIDING) currentPage = (currentPage + direction + PAGE_COUNT) % PAGE_COUNT;
   else if (appState == SUMMARY) summaryPage = (summaryPage + direction + 4) % 4;
   else if (appState == ANCS_TEST && ancsHistoryCount) {
@@ -3459,7 +4066,7 @@ void moveSelection(int direction, uint32_t now) {
     ancsHistoryPage = constrain(next, 0, int(ancsHistoryCount));
   }
   else if (appState == MENU || appState == OPTIONS_MENU || appState == RIDE_MENU) {
-    const int count = appState == MENU ? 1 : (appState == OPTIONS_MENU ? 7 : 2);
+    const int count = appState == MENU ? 1 : (appState == OPTIONS_MENU ? 6 : 2);
     menuSelection = (menuSelection + direction + count) % count;
   } else if (appState == DISPLAY_PAGE) {
     int next = int(normalBrightness) + direction * 16;
@@ -3472,6 +4079,8 @@ void moveSelection(int direction, uint32_t now) {
 void requestConfirmation(PendingAction action, AppState returnState) {
   pendingAction = action;
   confirmReturnState = returnState;
+  odometerResetArmed = false;
+  odometerResetSliderActive = false;
   appState = CONFIRM_PAGE;
   previousDrawMs = 0;
 }
@@ -3480,12 +4089,46 @@ void activate(uint32_t now) {
   // Prevent a release/bounce from activating the mostly-black area of the
   // destination screen and immediately navigating back.
   ignoreTouchUntilMs = now + MENU_TOUCH_LOCKOUT_MS;
-  if (appState == RIDING) {
+  if(appState==RIDE_CANCELED) {
+    openHome();
+  } else if (appState == RIDING) {
+    if(!routeNavigationEnabled && currentPage==gpx::PAGE_INDEX) {
+      const int zoom=freeRideMapZoomControl(lastTapX,lastTapY);
+      if(zoom) {adjustFreeRideMapZoom(zoom,now);return;}
+    }
     if (lastTapY >= SCREEN_SIZE * 78 / 100) openRideMenu();
   } else if (appState == CONFIRM_PAGE) {
-    const bool yes = lastTapX >= ux(84) && lastTapX <= ux(156) &&
-                     lastTapY >= uy(105) && lastTapY <= uy(141);
     const PendingAction action = pendingAction;
+    if (action == ACTION_RESET_ODOMETER) {
+      if (odometerResetArmed) {
+        // A short/incomplete slider touch produces no gesture. Any separate
+        // tap on the surrounding popup or black area cancels safely.
+        odometerResetArmed = false;
+        odometerResetSliderActive = false;
+        pendingAction = ACTION_NONE;
+        appState = confirmReturnState;
+        previousDrawMs = 0;
+        return;
+      }
+      const bool ok = lastTapX >= ux(84) && lastTapX <= ux(156) &&
+                      lastTapY >= uy(144) && lastTapY <= uy(186);
+      if (ok) {
+        odometerResetArmed = true;
+        odometerResetSliderX = ux(77);
+        ignoreTouchUntilMs = now + MENU_TOUCH_LOCKOUT_MS;
+        previousDrawMs = 0;
+      } else {
+        pendingAction = ACTION_NONE;
+        appState = confirmReturnState;
+        previousDrawMs = 0;
+      }
+      return;
+    }
+    const bool tripReset = action == ACTION_RESET_TRIP_A ||
+                           action == ACTION_RESET_TRIP_B;
+    const bool yes = lastTapX >= ux(84) && lastTapX <= ux(156) &&
+                     lastTapY >= uy(tripReset ? 128 : 105) &&
+                     lastTapY <= uy(tripReset ? 174 : 141);
     pendingAction = ACTION_NONE;
     if (!yes) {
       if (action == ACTION_DELETE_RIDE) pendingRideDeleteIndex = -1;
@@ -3516,36 +4159,49 @@ void activate(uint32_t now) {
     else if (onMenu) openOptionsMenu();
     else { appState = READY; previousDrawMs = 0; }
   } else if (appState == OPTIONS_MENU) {
-    const int halfWidths[] = {60, 85, 85, 82, 48, 82, 34};
-    int hit = -1;
-    for (int i = 0; i < 7; ++i) {
-      if (abs(lastTapX - CENTER) <= ux(halfWidths[i]) &&
-          abs(lastTapY - uy(49 + i * 26)) <= uy(13)) {
-        hit = i;
-        break;
-      }
+    const bool onRidar = lastTapX >= ux(45) && lastTapX <= ux(215) &&
+                         lastTapY >= uy(130) && lastTapY <= uy(172);
+    if (onRidar) {
+      ridarEnabled = !ridarEnabled;
+      riderNetwork.setEnabled(ridarEnabled);
+      if (deviceStorageReady) devicePreferences.putBool("ridar_on",ridarEnabled);
+      previousDrawMs = 0;
+      return;
     }
-    if (hit < 0) { openMenu(); return; }
+    int hit = -1;
+    const bool left = lastTapX >= ux(17) && lastTapX <= ux(117);
+    const bool right = lastTapX >= ux(123) && lastTapX <= ux(223);
+    int row = -1;
+    if (lastTapY >= uy(34) && lastTapY <= uy(66)) row = 0;
+    else if (lastTapY >= uy(67) && lastTapY <= uy(99)) row = 1;
+    else if (lastTapY >= uy(100) && lastTapY <= uy(128)) row = 2;
+    if (row >= 0 && (left || right)) hit = row * 2 + (right ? 1 : 0);
+    // Touching the slider without dragging it far enough leaves this menu in
+    // place. Black space beside it retains the universal Home action.
+    const bool onPowerSlider = lastTapX >= ux(63) && lastTapX <= ux(177) &&
+                               lastTapY >= uy(176) && lastTapY <= uy(232);
+    if (onPowerSlider) return;
+    if (hit < 0) { openHome(); return; }
     menuSelection = hit;
     if (hit == 0) {
       statusReturnState = OPTIONS_MENU;
       statusPage = 0;
       appState = STATUS_PAGE;
       previousDrawMs = 0;
-    } else if (hit == 1) { appState=BLUETOOTH_PAGE;previousDrawMs=0; }
-    else if (hit == 2) openDisplayPage(now, OPTIONS_MENU);
+    } else if (hit == 1) {
+      routeSelectionForStart=false;selectedRouteRow=0; appState = ROUTES_LIST; previousDrawMs = 0;
+    } else if (hit == 2) { appState=BLUETOOTH_PAGE;previousDrawMs=0; }
     else if (hit == 3) {
+      ridesEditMode = false;
+      appState = RIDES_LIST;
+      previousDrawMs = 0;
+    } else if (hit == 4) openDisplayPage(now, OPTIONS_MENU);
+    else if (hit == 5) {
       statusReturnState = OPTIONS_MENU;
       statusPage = 1;
       appState = STATUS_PAGE;
       previousDrawMs = 0;
-    } else if (hit == 4) {
-      ridesEditMode = false;
-      appState = RIDES_LIST;
-      previousDrawMs = 0;
-    } else if (hit == 5) {
-      routeSelectionForStart=false;selectedRouteRow=0; appState = ROUTES_LIST; previousDrawMs = 0;
-    } else requestConfirmation(ACTION_POWER_OFF, OPTIONS_MENU);
+    }
   } else if (appState == ANCS_TEST) {
     const bool exit = lastTapX >= ux(65) && lastTapX <= ux(175) &&
                       lastTapY >= uy(194) && lastTapY <= uy(239);
@@ -3611,18 +4267,30 @@ void activate(uint32_t now) {
       previousDrawMs = 0;
     }
   } else if (appState == STATUS_PAGE) {
-    if (statusPage == 1 && lastTapY >= uy(184) && lastTapY <= uy(225)) {
-      if (lastTapX >= ux(22) && lastTapX <= ux(120))
-        requestConfirmation(ACTION_RESET_TRIP_A, STATUS_PAGE);
-      else if (lastTapX >= ux(120) && lastTapX <= ux(218))
-        requestConfirmation(ACTION_RESET_TRIP_B, STATUS_PAGE);
-      return;
+    if (statusPage == 1) {
+      const bool onTripA = lastTapX >= ux(20) && lastTapX <= ux(220) &&
+                           lastTapY >= uy(96) && lastTapY <= uy(137);
+      const bool onTripB = lastTapX >= ux(20) && lastTapX <= ux(220) &&
+                           lastTapY > uy(137) && lastTapY <= uy(176);
+      if (onTripA || onTripB) {
+        requestConfirmation(onTripA ? ACTION_RESET_TRIP_A : ACTION_RESET_TRIP_B,
+                            STATUS_PAGE);
+        return;
+      }
+      const bool onResetOdo = lastTapX >= ux(60) && lastTapX <= ux(180) &&
+                              lastTapY >= uy(178) && lastTapY <= uy(232);
+      if (onResetOdo) {
+        requestConfirmation(ACTION_RESET_ODOMETER, STATUS_PAGE);
+        return;
+      }
     }
-    if (statusReturnState == RIDE_MENU) openRideMenu();
-    else if (statusReturnState == OPTIONS_MENU) openOptionsMenu();
+    if (statusReturnState == RIDE_MENU) {
+      openRideMenu();
+    } else if (statusReturnState == OPTIONS_MENU) openOptionsMenu();
     else openMenu();
   } else if (appState == DISPLAY_PAGE) {
-    if (displayReturnState == OPTIONS_MENU) openOptionsMenu(); else openRideMenu();
+    if (displayReturnState == OPTIONS_MENU) openOptionsMenu();
+    else openRideMenu();
   }
   else if (appState == SUMMARY) {
     const bool done = summaryPage == 3 &&
@@ -3695,17 +4363,22 @@ void setup() {
   display->setBrightness(normalBrightness);
   // Original startup splash fallback (kept intentionally):
   // showBrandSplash("HIO", 2000);
-  showPedalOneStartupSplash();
+  const uint32_t splashLogoReadyMs = showPedalOneStartupSplashIntro();
   onboardGpsPresent = onboardGps.begin(Wire, millis());
   Serial.printf("Location source: %s\n",
                 onboardGpsPresent ? "onboard LC76G" : "BLE GPS relay");
   setenv("TZ", "PST8PDT,M3.2.0,M11.1.0", 1);
   tzset();
-  gpxLibrary.restore(rideStorageReady);
+  gpxLibrary.restore(rideStorageReady,FW_VERSION);
   loadOdometers();
   loadDeviceNickname();
   if(deviceStorageReady)bluetoothEnabled=devicePreferences.getBool("ble_on",true);
+  if(deviceStorageReady)ridarEnabled=devicePreferences.getBool("ridar_on",false);
+  riderNetwork.setEnabled(ridarEnabled);
   setupBluetooth();
+  // Initialization ran behind the completed logo. Exit only after everything
+  // needed by the home screen is ready, so there is no blank interstitial.
+  finishPedalOneStartupSplash(splashLogoReadyMs);
   lastActivityMs = millis();
   drawReadyScreen(millis());
   if (PEDALONE_GPX_DEMO_BOOT) {
@@ -3718,14 +4391,20 @@ void loop() {
   wifiConfig.loop(otaCanStart() && !otaUpdate.active() && !otaUpdate.rebootPending(), phoneConnected);
   uint32_t now = millis();
   if(bluetoothEnabled) { notifications.loop(); otaUpdate.loop(phoneConnected); }
-  if (otaUpdate.active() != otaLinkFast) {
-    otaLinkFast = otaUpdate.active();
+  const bool bulkTransferActive = otaUpdate.active() || sharedMap.active();
+  if (bulkTransferActive != otaLinkFast) {
+    otaLinkFast = bulkTransferActive;
     notifications.setOtaMode(otaLinkFast);
   }
   updateBattery(now);
   const bool routeCanChange = (appState==READY || appState==MENU || appState==OPTIONS_MENU ||
       appState==GPX_DEMO || appState==ROUTES_LIST || appState==START_ROUTE_MENU) && !otaUpdate.active() && !otaUpdate.rebootPending();
   if(bluetoothEnabled) gpxLibrary.loop(routeCanChange);
+  if(bluetoothEnabled) sharedMap.loop(routeCanChange);
+  // Map packages can take long enough to cross the normal inactivity limit.
+  // Treat every queued or active transfer packet as user activity so neither
+  // sleep tier can interrupt the file while the phone is sending it.
+  if (sharedMap.active()) lastActivityMs = now;
   if(gpxLibrary.changed) {
     gpxLibrary.changed=false; gpxSimulation.reset(now);
     gpxLastProgress=-1;gpxRecoveryProgress=0;gpxLiveBearing=NAN;
@@ -3733,6 +4412,25 @@ void loop() {
     gpxGuidance.reset();gpxFixReceived=0;
     previousDrawMs=0;
   }
+  LocationPacket ridarLocation{};
+  uint32_t ridarLocationMs=0;
+  bool ridarLocationValid=false;
+  portENTER_CRITICAL(&locationMux);
+  ridarLocation=latestLocation;
+  ridarLocationMs=lastLocationMs;
+  ridarLocationValid=hasLocation;
+  portEXIT_CRITICAL(&locationMux);
+  ridarLocationValid=ridarLocationValid &&
+      timestampIsFresh(now,ridarLocationMs,LOCATION_TIMEOUT_MS) &&
+      ridarLocation.latitudeE7>=-850000000 && ridarLocation.latitudeE7<=850000000 &&
+      ridarLocation.longitudeE7>=-1800000000 && ridarLocation.longitudeE7<=1800000000;
+  riderNetwork.setEnabled(ridarEnabled);
+  const bool ridersChanged=riderNetwork.service(
+      wifiConfig.busy() || otaUpdate.active() || otaUpdate.rebootPending(),
+      ridarLocationValid,ridarLocation.latitudeE7,ridarLocation.longitudeE7,
+      deviceNickname,now);
+  if(ridersChanged && appState==RIDING && currentPage==RIDAR_PAGE_INDEX)
+    previousDrawMs=0;
   if (otaUpdate.active() || otaUpdate.rebootPending()) {
     if (!previousDrawMs || now - previousDrawMs >= 250) {
       previousDrawMs = now;
@@ -3772,13 +4470,17 @@ void loop() {
     delay(5);return;
   }
   if(appState==START_ROUTE_MENU) {
-    if(gesture==GESTURE_UP) {appState=MENU;previousDrawMs=0;return;}
+    if(gesture==GESTURE_START_DEMO) {
+      startDemoRide(now);
+      return;
+    }
+    if(gesture==GESTURE_UP) {openMenu();return;}
     if(gesture==GESTURE_TAP) {
       const bool inButtonColumn=lastTapX>=ux(26) && lastTapX<=ux(214);
       if(inButtonColumn && lastTapY>=uy(80) && lastTapY<=uy(128)) {
         ignoreTouchUntilMs=now+MENU_TOUCH_LOCKOUT_MS;routeSelectionForStart=true;selectedRouteRow=0;appState=ROUTES_LIST;previousDrawMs=0;
       } else if(inButtonColumn && lastTapY>=uy(142) && lastTapY<=uy(190)) {
-        routeNavigationEnabled=false;startCountdown(now);
+        routeNavigationEnabled=false;resetFreeRideMap(now);startCountdown(now);
       } else {
         openMenu();
       }
@@ -3793,18 +4495,27 @@ void loop() {
     if(lastActivityMs && now-lastActivityMs>=AUTO_POWER_OFF_MS) {enterLowPowerSleep();return;}
     const int count=max(1,int(gpxLibrary.routeCount));
     selectedRouteRow=constrain(selectedRouteRow,0,count-1);
-    if(gesture==GESTURE_TAP && lastTapY>=uy(95) && lastTapY<uy(178)) {
-      selectedRouteRow=(selectedRouteRow+(lastTapX<CENTER ? count-1 : 1))%count;
+    if(gesture==GESTURE_UP) {
+      appState=routeSelectionForStart ? START_ROUTE_MENU : OPTIONS_MENU;
+      previousDrawMs=0;
+      return;
     }
-    if(gesture==GESTURE_UP) {appState=routeSelectionForStart ? START_ROUTE_MENU : OPTIONS_MENU;previousDrawMs=0;return;}
-    if(gpxLibrary.routeCount && routeSelectionForStart && gesture==GESTURE_TAP &&
-       lastTapY>=uy(182) && lastTapY<=uy(222) &&
-       lastTapX>=ux(66) && lastTapX<=ux(174)) {
-      bool ok=true;
-      if(gpxLibrary.routeCount) ok=gpxLibrary.select(gpxLibrary.routes[selectedRouteRow].id);
-      else gpxLibrary.useExample();
-      if(ok) {
-        routeNavigationEnabled=true;routeSelectionForStart=false;startCountdown(now);
+    if(gesture==GESTURE_TAP) {
+      const bool onStart=gpxLibrary.routeCount && routeSelectionForStart &&
+          lastTapY>=uy(182) && lastTapY<=uy(222) &&
+          lastTapX>=ux(66) && lastTapX<=ux(174);
+      const bool onLeft=lastTapX<=ux(58) && lastTapY>=uy(88) && lastTapY<uy(174);
+      const bool onRight=lastTapX>=ux(182) && lastTapY>=uy(88) && lastTapY<uy(174);
+      if(onStart) {
+        const bool ok=gpxLibrary.select(gpxLibrary.routes[selectedRouteRow].id);
+        if(ok) {
+          routeNavigationEnabled=true;routeSelectionForStart=false;startCountdown(now);
+        }
+      } else if(onLeft || onRight) {
+        selectedRouteRow=(selectedRouteRow+(onLeft ? count-1 : 1))%count;
+      } else {
+        appState=routeSelectionForStart ? START_ROUTE_MENU : OPTIONS_MENU;
+        previousDrawMs=0;
       }
       previousDrawMs=0;return;
     }
@@ -3841,9 +4552,32 @@ void loop() {
   const bool navigationActive = !(routeNavigationEnabled && (appState==RIDING || appState==RIDE_MENU)) &&
       appState != ANCS_TEST &&
       appState != SAVE_RIDE_PROMPT && appState != CONFIRM_PAGE &&
+      appState != RIDE_CANCELED &&
       navigationIsVisible(now);
 
-  if (appState==RIDING && gpxPageAlert.active && gesture==GESTURE_TAP) {
+  if (appState == CONFIRM_PAGE && pendingAction == ACTION_RESET_ODOMETER &&
+      odometerResetArmed && gesture == GESTURE_ODOMETER_RESET) {
+    resetOdometer();
+    odometerResetArmed = false;
+    odometerResetSliderActive = false;
+    pendingAction = ACTION_NONE;
+    appState = STATUS_PAGE;
+    statusPage = 1;
+    ignoreTouchUntilMs = now + MENU_TOUCH_LOCKOUT_MS;
+    previousDrawMs = 0;
+  // Summary swipe-up is always an exit gesture, even if an ANCS navigation
+  // card happens to be visible over the summary at that moment.
+  } else if (appState == SUMMARY && gesture == GESTURE_UP) {
+    ignoreTouchUntilMs = now + MENU_TOUCH_LOCKOUT_MS;
+    if (!viewingSavedRide && rideStorageReady &&
+        strcmp(summaryGpsPath, ACTIVE_GPS_PATH) == 0)
+      FFat.remove(ACTIVE_GPS_PATH);
+    openHome();
+    if (!viewingSavedRide) notifyPhone("ready");
+  } else if (appState == OPTIONS_MENU && gesture == GESTURE_POWER_OFF) {
+    enterLowPowerSleep(true);
+    return;
+  } else if (appState==RIDING && gpxPageAlert.active && gesture==GESTURE_TAP) {
     gpxPageAlert.dismiss(currentPage);previousDrawMs=0;
   } else if (appState==RIDING && gpxPageAlert.active &&
              (gesture==GESTURE_LEFT || gesture==GESTURE_RIGHT)) {
@@ -3855,30 +4589,59 @@ void loop() {
              (gesture==GESTURE_LEFT || gesture==GESTURE_RIGHT)) {
     gpxTurnPreview.active=false;
     moveSelection(gesture==GESTURE_LEFT ? 1 : -1,now);
-  } else if (navigationActive && gesture == GESTURE_TAP) {
+  } else if (navigationActive &&
+             (gesture == GESTURE_TAP || gesture == GESTURE_UP)) {
     portENTER_CRITICAL(&navMux);
     navVisible = false;
     portEXIT_CRITICAL(&navMux);
-    previousDrawMs = 0;
+    if (gesture == GESTURE_UP && appState != RIDING && appState != RIDE_MENU)
+      openHome();
+    else previousDrawMs = 0;
   } else if (!navigationActive && gesture == GESTURE_UP) {
-    if (appState == ANCS_TEST || appState == SAVE_RIDE_PROMPT) {
-      // These modal screens exit only through their explicit controls.
+    if (appState == SAVE_RIDE_PROMPT) {
+      // Back must never lose a completed ride; use the safe action.
+      completeRideEnd(true);
+    } else if (appState == ANCS_TEST) {
+      notifications.setAcceptAll(false);
+      openOptionsMenu();
+    } else if (appState == RIDE_CANCELED) {
+      openHome();
     } else if (appState == CONFIRM_PAGE) {
       appState = confirmReturnState;
       pendingAction = ACTION_NONE;
+      odometerResetArmed = false;
+      odometerResetSliderActive = false;
       previousDrawMs = 0;
     } else {
     const bool rideContext = appState == RIDING || appState == RIDE_MENU ||
         (appState == DISPLAY_PAGE && displayReturnState == RIDE_MENU) ||
         (appState == STATUS_PAGE && statusReturnState == RIDE_MENU);
-    if (appState == MENU) {
-      // The dedicated bottom button opens pre-ride options.
-    } else if (rideContext) openRideMenu();
-    else if (appState == OPTIONS_MENU || appState == RIDES_LIST ||
-             (appState == STATUS_PAGE && statusReturnState == OPTIONS_MENU) ||
-             (appState == DISPLAY_PAGE && displayReturnState == OPTIONS_MENU))
-      openOptionsMenu();
-    else if (appState != COUNTDOWN) openMenu();
+    if (appState == READY) {previousDrawMs=0;}
+    else if (appState == MENU) openHome();
+    else if (appState == RIDE_MENU) {appState=RIDING;previousDrawMs=0;}
+    else if (rideContext) openRideMenu();
+    else if (appState == OPTIONS_MENU) openHome();
+    else if (appState == RIDES_LIST) {ridesEditMode=false;openOptionsMenu();}
+    else if (appState == STATUS_PAGE) {
+      if(statusReturnState==RIDE_MENU)openRideMenu();
+      else if(statusReturnState==OPTIONS_MENU)openOptionsMenu();
+      else openMenu();
+    } else if (appState == DISPLAY_PAGE) {
+      if(displayReturnState==RIDE_MENU)openRideMenu();
+      else openOptionsMenu();
+    } else if (appState == SUMMARY) {
+      if (!viewingSavedRide && rideStorageReady &&
+          strcmp(summaryGpsPath, ACTIVE_GPS_PATH) == 0) FFat.remove(ACTIVE_GPS_PATH);
+      appState=viewingSavedRide ? RIDES_LIST : READY;
+      if(viewingSavedRide)ridesEditMode=false;
+      previousDrawMs=0;
+      if(!viewingSavedRide)notifyPhone("ready");
+    } else if (appState == COUNTDOWN) {
+      routeNavigationEnabled=false;
+      routeSelectionForStart=false;
+      appState=RIDE_CANCELED;
+      previousDrawMs=0;
+    } else openMenu();
     }
   } else if (!navigationActive && gesture == GESTURE_LEFT) moveSelection(+1, now);
   else if (!navigationActive && gesture == GESTURE_RIGHT) moveSelection(-1, now);
@@ -3890,10 +4653,12 @@ void loop() {
     updateRideData(now);
   if (appState == COUNTDOWN) {
     if (touchActive && nonNegativeElapsedMs(now,touchStartMs)>=2000) {
-      touchCancelConsumed=true;
+      touchCancelConsumed=false;
+      touchBlockedUntilRelease=true;
       routeNavigationEnabled=false;
       routeSelectionForStart=false;
-      openMenu();
+      appState=RIDE_CANCELED;
+      previousDrawMs=0;
     } else if (!touchActive && now-countdownStartMs>=3000) {
       // A hold begun near the end gets its full two seconds before starting.
       startRide(now);
@@ -3906,6 +4671,11 @@ void loop() {
   if (activeRide) {
     updateAutoBrightness(now);
     if(routeNavigationEnabled)updateGpxPosition(now);
+    else if(appState==RIDING &&
+            (currentPage==gpx::PAGE_INDEX || currentPage==RIDAR_PAGE_INDEX)) {
+      float unusedCourse=NAN;
+      updateGpxLiveFix(now,unusedCourse);
+    }
     if(appState==RIDING && routeNavigationEnabled && gpxFixAvailable && !ridePaused) {
       const int previousPage=currentPage;
       const bool off=gpxGuidance.mode()==gpx::OFF_COURSE && !gpxArrived;
@@ -3929,8 +4699,13 @@ void loop() {
   uint32_t interval = 1000;
   if (appState == READY) interval = 50;
   else if (appState == COUNTDOWN) interval = 33;
-  else if (appState == RIDING) interval = 83;
-  if (!previousDrawMs || now - previousDrawMs >= interval) {
+  else if (navigationActive) interval = 1000;
+  else if (appState == RIDING) interval = rideFrameIntervalMs();
+  const bool deferLiveMapForTouch = appState == RIDING &&
+      (currentPage == gpx::PAGE_INDEX || currentPage == RIDAR_PAGE_INDEX) &&
+      touchActive;
+  if (!deferLiveMapForTouch &&
+      (!previousDrawMs || now - previousDrawMs >= interval)) {
     previousDrawMs = now;
     if (navigationActive) drawNavigationPage(now);
     else if (appState == READY) drawReadyScreen(now);
@@ -3940,6 +4715,7 @@ void loop() {
     else if (appState == STATUS_PAGE) drawStatus(now);
     else if (appState == DISPLAY_PAGE) drawDisplayPage(now);
     else if (appState == COUNTDOWN) drawCountdown(now);
+    else if (appState == RIDE_CANCELED) drawRideCanceled(now);
     else if (appState == RIDING) drawRidePage(now);
     else if (appState == CONFIRM_PAGE) drawConfirmation(now);
     else if (appState == SAVE_RIDE_PROMPT) drawSaveRidePrompt(now);

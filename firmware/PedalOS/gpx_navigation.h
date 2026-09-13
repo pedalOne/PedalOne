@@ -6,6 +6,9 @@
 
 namespace gpx {
 constexpr float SPEED_MPS = 17.8816f;
+constexpr float JOIN_DISTANCE_METERS = 35.0f;
+constexpr float OFF_COURSE_DISTANCE_METERS = 60.0f;
+constexpr float COURSE_DIRECTION_LIMIT = 100.0f * 0.017453292519943295f;
 constexpr unsigned MAX_POINTS = 4096;
 constexpr double RAD = 0.017453292519943295;
 constexpr double EARTH = 6371000;
@@ -75,18 +78,25 @@ inline float pointDistance(const GpxPoint &a,const GpxPoint &b) {
   return distance(lat0+a.north/(EARTH*RAD),lon0+a.east/(EARTH*RAD*lonScale),
                   lat0+b.north/(EARTH*RAD),lon0+b.east/(EARTH*RAD*lonScale));
 }
-enum GuidanceMode { TO_START, ON_ROUTE, OFF_COURSE };
+enum GuidanceMode { TO_START, TO_ROUTE, ON_ROUTE, OFF_COURSE };
 struct Guidance {
-  bool joined=false, offCourse=false;
-  void reset() { joined=false;offCourse=false; }
-  void update(float distanceToStart,float offset,bool wrongWay=false) {
-    if(!joined && distanceToStart<=30)joined=true;
+  bool joined=false, offCourse=false, joiningAtStart=true;
+  void reset() { joined=false;offCourse=false;joiningAtStart=true; }
+  void update(float distanceToTarget,float offset,bool wrongWay=false,
+              float targetMeters=0) {
+    if(!joined) {
+      joiningAtStart=targetMeters<=30;
+      if(distanceToTarget<=JOIN_DISTANCE_METERS && !wrongWay)joined=true;
+    }
     if(joined) {
-      if(offset>50 || wrongWay)offCourse=true;
-      else if(offset<25 && !wrongWay)offCourse=false;
+      if(offset>OFF_COURSE_DISTANCE_METERS || wrongWay)offCourse=true;
+      else if(offset<JOIN_DISTANCE_METERS && !wrongWay)offCourse=false;
     }
   }
-  GuidanceMode mode() const { return !joined ? TO_START : (offCourse ? OFF_COURSE : ON_ROUTE); }
+  GuidanceMode mode() const {
+    return !joined ? (joiningAtStart ? TO_START : TO_ROUTE)
+                   : (offCourse ? OFF_COURSE : ON_ROUTE);
+  }
 };
 inline float heading(float d) {
   const unsigned i=segmentAt(clamp(d,0,length()));
@@ -108,7 +118,10 @@ struct Simulation {
 };
 struct Cue { float meters,angle; };
 constexpr int PAGE_INDEX = 2;
-inline bool slightTurn(float angle) { return std::fabs(angle)<60.0f*RAD; }
+// A normal left/right begins at 45 degrees. The previous 60-degree boundary
+// made rounded 60-90 degree GPX corners appear as a slight-turn arrow after
+// their approach/departure bearings were averaged across 25 meters.
+inline bool slightTurn(float angle) { return std::fabs(angle)<45.0f*RAD; }
 struct GuidancePageAlert {
   bool active=false,wasOffCourse=false,arrivalShown=false;
   int returnPage=0;
@@ -198,5 +211,23 @@ inline RouteMatch nearestMatch(float east,float north,float minimum,float maximu
     }
   }
   return result;
+}
+// Recovery guidance is a purely geometric projection. It deliberately ignores
+// ordered-progress and heading penalties so the arrow terminates at the actual
+// closest tangent point anywhere on the GPX polyline.
+inline RouteMatch nearestTangent(float east,float north) {
+  return nearestMatch(east,north,0,length(),NAN);
+}
+inline bool wrongDirection(const RouteMatch &match,float course) {
+  return std::isfinite(course) && std::isfinite(match.tangent) &&
+      std::fabs(wrapAngle(match.tangent-course))>COURSE_DIRECTION_LIMIT;
+}
+inline bool canGloballyRejoin(const RouteMatch &match,float course,
+                              float previousProgress) {
+  if(!match.valid || match.offset>=JOIN_DISTANCE_METERS || wrongDirection(match,course))
+    return false;
+  // Heading is required for a large jump so an overlapping outbound/return
+  // leg cannot be selected merely because the rider is stationary nearby.
+  return std::isfinite(course) || std::fabs(match.meters-previousProgress)<=300.0f;
 }
 } // namespace gpx
