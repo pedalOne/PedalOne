@@ -13,6 +13,7 @@ class WifiConfig {
   void begin(BLEServer *server);
   void loop(bool allowed, bool bluetoothConnected);
   void stop(bool report = true);
+  bool busy() const { return connecting_ || online_; }
  private:
   class Callbacks;
   struct Command { uint8_t size; uint8_t bytes[100]; };

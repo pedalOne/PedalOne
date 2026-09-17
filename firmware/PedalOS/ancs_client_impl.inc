@@ -95,6 +95,10 @@ void AncsClient::begin(const char *deviceName) {
       "8E400008-F315-4F60-9FB8-838830DAEA50",
       BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_WRITE |
           BLECharacteristic::PROPERTY_WRITE_NR | BLECharacteristic::PROPERTY_NOTIFY);
+  bridgeService->createCharacteristic(
+      "8E400009-F315-4F60-9FB8-838830DAEA50",
+      BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_WRITE |
+          BLECharacteristic::PROPERTY_NOTIFY);
   bridgeService->start();
   ble_gap_event_listener_register(new ble_gap_event_listener(), gapEvent, this);
 }

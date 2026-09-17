@@ -284,6 +284,13 @@ class GpxLibrary : public BLECharacteristicCallbacks {
     if(done){done.write(uint8_t(1));done.close();}
   }
   const char *name() const { return activeName; }
+  bool active() {
+    bool commandQueued=false;
+    portENTER_CRITICAL(&mux);
+    commandQueued=queued;
+    portEXIT_CRITICAL(&mux);
+    return commandQueued || staging || bool(thumbnailTransfer);
+  }
   bool openThumbnail(uint32_t id,File &file,GpxThumbnailHeader &header) const {
     char path[32];thumbnailPath(id,path);file=FFat.open(path,FILE_READ);
     if(!file || file.read(reinterpret_cast<uint8_t*>(&header),sizeof(header))!=sizeof(header) ||

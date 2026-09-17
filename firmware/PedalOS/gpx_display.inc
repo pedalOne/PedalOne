@@ -16,6 +16,9 @@ uint8_t freeRideMapZoomLevel=1;
 float freeRideMapDisplayedScale=0.65f;
 bool freeRideMapZoomAnimating=false;
 uint32_t freeRideMapPreviousFrameMs=0;
+float ridarMapDisplayedScale=1.35f;
+bool ridarMapZoomAnimating=false;
+uint32_t ridarMapPreviousFrameMs=0;
 void drawRouteFilename(const char *name,int y,uint32_t now,uint8_t size=1) {
   String title(name);
   const unsigned visible=size>=3 ? 17 : (size==2 ? 25 : 27);
@@ -333,7 +336,10 @@ void drawGpxRoute(float meters, bool demo, bool hasFix, float offset) {
                        CENTER+us(8),riderY+us(8),0x039F);
   if(!darkenGpxMapForehead())return;
   // Redraw guidance over the shaded map using the same hierarchy as demo mode.
-  textCentered(arrived ? "ARRIVED" : distance,CENTER,52,5,arrived ? GREEN : guidanceColor);
+  // The compact map clock occupies the very top of the round display. Keep
+  // the large maneuver distance below it with a deliberate visual gap.
+  drawClock(millis(),us(10),2);
+  textCentered(arrived ? "ARRIVED" : distance,CENTER,58,5,arrived ? GREEN : guidanceColor);
   if(guidance) {
     drawGpxDirectionArrow(gpx::wrapAngle(gpx::pointBearing(position,target)-bearing),guidanceColor);
   } else if(cue.angle!=0 && !arrived) {
@@ -448,12 +454,14 @@ void updateGpxPosition(uint32_t now) {
 }
 void drawLiveGpxPage(uint32_t now) {
   if(!routeNavigationEnabled) {
-    beginFrame();textCentered("No GPX selected",CENTER,uy(115),3,WHITE);
+    beginFrame();drawClock(now,us(10),2);
+    textCentered("No GPX selected",CENTER,uy(115),3,WHITE);
     drawRidePageDots();endFrame();return;
   }
   updateGpxPosition(now);
   if(!gpxFixAvailable) {
-    beginFrame();textCentered("Waiting for GPS",CENTER,uy(105),3,WHITE);
+    beginFrame();drawClock(now,us(10),2);
+    textCentered("Waiting for GPS",CENTER,uy(105),3,WHITE);
     drawRidePageDots();endFrame();return;
   }
   drawGpxRoute(max(0.0f,gpxLastProgress),false,true,0);
@@ -463,6 +471,7 @@ void drawFreeRideMapPage(uint32_t now) {
   updateGpxLiveFix(now,unusedCourse);
   if(!gpxFixAvailable) {
     beginFrame();
+    drawClock(now,us(10),2);
     textCentered("Waiting for GPS",CENTER,uy(105),3,WHITE);
     drawRidePageDots();
     endFrame();
@@ -494,6 +503,135 @@ void drawFreeRideMapPage(uint32_t now) {
   canvas->drawCircle(controlX,minusY,radius-1,WHITE);
   canvas->drawFastHLine(controlX-us(9),minusY,us(18),WHITE);
 
+  drawClock(now,us(10),2);
+  drawRidePageDots();
+  drawPausedBadge();
+  endAnimatedFrame();
+}
+
+void drawRidarRoute(const GpxPoint &mapCenter,float bearing,float mapScale) {
+  if(!routeNavigationEnabled || gpx::count<2)return;
+  const float sine=sinf(bearing),cosine=cosf(bearing);
+  constexpr uint16_t routeBlue=0x05BF;
+  bool previousVisible=false;
+  int previousX=0,previousY=0;
+  for(unsigned i=0;i<gpx::count;++i) {
+    if((i&31)==0 && (touchPending || touchActive))return;
+    const auto &point=gpx::points[i];
+    const float east=point.east-mapCenter.east;
+    const float north=point.north-mapCenter.north;
+    const int x=CENTER+lroundf((east*cosine-north*sine)*mapScale);
+    const int y=uy(185)-lroundf((east*sine+north*cosine)*mapScale);
+    const bool visible=x>-8 && x<SCREEN_SIZE+8 && y>-8 && y<SCREEN_SIZE+8;
+    if(visible && previousVisible)
+      drawSharedMapStroke(previousX,previousY,x,y,3,routeBlue);
+    previousVisible=visible;
+    previousX=x;previousY=y;
+  }
+}
+
+void drawRidarPage(uint32_t now) {
+  if(!ridarEnabled) {
+    beginFrame();
+    drawClock(now,us(10),2);
+    textCentered("RiDar Off",CENTER,uy(105),4,WHITE);
+    textCentered("Enable in Menu",CENTER,uy(137),2,0xAD55);
+    drawRidePageDots();
+    endFrame();
+    return;
+  }
+
+  float unusedCourse=NAN;
+  updateGpxLiveFix(now,unusedCourse);
+  if(!gpxFixAvailable) {
+    beginFrame();
+    drawClock(now,us(10),2);
+    textCentered("Waiting for GPS",CENTER,uy(105),3,WHITE);
+    textCentered("RiDar listening",CENTER,uy(137),2,0xAD55);
+    drawRidePageDots();
+    endFrame();
+    return;
+  }
+
+  struct ScreenRider { RiderNetwork::Rider rider; GpxPoint position; };
+  RiderNetwork::Rider snapshot[RiderNetwork::MAX_RIDERS]{};
+  ScreenRider riders[RiderNetwork::MAX_RIDERS]{};
+  const size_t riderCount=riderNetwork.snapshot(
+      snapshot,RiderNetwork::MAX_RIDERS,now);
+  const float bearing=std::isfinite(gpxLiveBearing) ? gpxLiveBearing : 0.0f;
+  const float sine=sinf(bearing),cosine=cosf(bearing);
+  float minimumRight=0,maximumRight=0,minimumForward=0,maximumForward=0;
+  for(size_t i=0;i<riderCount;++i) {
+    const float east=gpx::longitudeDelta(
+        gpx::lon0,snapshot[i].longitudeE7*1e-7)*gpx::RAD*gpx::EARTH*gpx::lonScale;
+    const float north=(snapshot[i].latitudeE7*1e-7-gpx::lat0)*gpx::RAD*gpx::EARTH;
+    riders[i]={snapshot[i],{east,north,0}};
+    const float deltaEast=east-gpxLivePosition.east;
+    const float deltaNorth=north-gpxLivePosition.north;
+    const float right=deltaEast*cosine-deltaNorth*sine;
+    const float forward=deltaEast*sine+deltaNorth*cosine;
+    minimumRight=min(minimumRight,right);maximumRight=max(maximumRight,right);
+    minimumForward=min(minimumForward,forward);maximumForward=max(maximumForward,forward);
+  }
+
+  // Include comfortable marker/name padding, then stop at the existing
+  // closest 100-foot scale even when the group is tightly packed.
+  const float targetScale=max(0.05f,min(1.35f,min(
+      350.0f/max(1.0f,maximumRight-minimumRight+50.0f),
+      340.0f/max(1.0f,maximumForward-minimumForward+50.0f))));
+  const float seconds=ridarMapPreviousFrameMs
+      ? min(uint32_t(250),now-ridarMapPreviousFrameMs)*0.001f : 0.0f;
+  ridarMapPreviousFrameMs=now;
+  const float maximumStep=0.8f*seconds;
+  ridarMapDisplayedScale+=constrain(targetScale-ridarMapDisplayedScale,
+                                   -maximumStep,maximumStep);
+  ridarMapZoomAnimating=fabsf(targetScale-ridarMapDisplayedScale)>0.002f;
+  const float mapScale=ridarMapDisplayedScale;
+
+  // Center the complete group in the useful map area. The shared renderer's
+  // normal navigation anchor is low on the screen, so shift its world center
+  // rearward until the group midpoint appears near the physical screen center.
+  const float centerRight=(minimumRight+maximumRight)*0.5f;
+  const float centerForward=(minimumForward+maximumForward)*0.5f;
+  const float desiredGroupY=230.0f;
+  const float mapOriginY=float(uy(185));
+  const float mapCenterForward=centerForward-(mapOriginY-desiredGroupY)/mapScale;
+  GpxPoint mapCenter={
+      gpxLivePosition.east+centerRight*cosine+mapCenterForward*sine,
+      gpxLivePosition.north-centerRight*sine+mapCenterForward*cosine,0};
+
+  beginFrame();
+  canvas->fillScreen(0x0841);
+  if(!drawSharedRoadMap(mapCenter,bearing,mapScale))return;
+  drawRidarRoute(mapCenter,bearing,mapScale);
+
+  const auto drawMarker=[&](const GpxPoint &point,const char *name,
+                            uint16_t color,bool self) {
+    const float east=point.east-mapCenter.east;
+    const float north=point.north-mapCenter.north;
+    const int x=CENTER+lroundf((east*cosine-north*sine)*mapScale);
+    const int y=uy(185)-lroundf((east*sine+north*cosine)*mapScale);
+    if(x<18 || x>SCREEN_SIZE-18 || y<18 || y>SCREEN_SIZE-18)return;
+    canvas->fillCircle(x,y,self ? us(11) : us(7),WHITE);
+    canvas->fillCircle(x,y,self ? us(7) : us(5),color);
+    if(name && name[0])textCentered(name,x,y-us(self ? 18 : 14),1,WHITE);
+  };
+
+  for(size_t i=0;i<riderCount;++i) {
+    const uint32_t age=uint32_t(now-riders[i].rider.lastSeenMs);
+    char signal[8];
+    snprintf(signal,sizeof(signal),"%d",int(riders[i].rider.rssi));
+    drawMarker(riders[i].position,signal,
+               age>8000 ? 0x8410 : GREEN,false);
+  }
+  drawMarker(gpxLivePosition,"YOU",0x039F,true);
+
+  char title[24];
+  snprintf(title,sizeof(title),"RiDar  %u",unsigned(riderCount));
+  drawClock(now,us(10),2);
+  canvas->fillRoundRect(CENTER-us(48),us(23),us(96),us(22),us(7),BLACK);
+  textCentered(title,CENTER,us(34),2,WHITE);
+  drawGpxMapReference(mapScale,bearing);
   drawRidePageDots();
   drawPausedBadge();
   endAnimatedFrame();

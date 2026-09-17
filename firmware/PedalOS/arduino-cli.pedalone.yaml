@@ -1,0 +1,4 @@
+directories:
+  data: /Users/paulpan/Library/Arduino15
+  downloads: /Users/paulpan/Library/Arduino15/staging
+  user: /Users/paulpan/Library/Caches/Arduino/PedalOne/user
