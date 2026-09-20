@@ -48,6 +48,7 @@ class DeviceIconStore : public BLECharacteristicCallbacks {
   uint16_t *pixels() { return pixels_; }
   uint8_t width() const { return WIDTH; }
   uint8_t height() const { return HEIGHT; }
+  uint32_t pixelChecksum() const { return ready_ ? pixelChecksum_ : 0; }
 
   void onWrite(BLECharacteristic *characteristic) override {
     const String value = characteristic->getValue();
@@ -66,6 +67,7 @@ class DeviceIconStore : public BLECharacteristicCallbacks {
       }
       ready_ = false;
       emojiChecksum_ = 0;
+      pixelChecksum_ = 0;
       status("cleared");
       return;
     }
@@ -201,10 +203,12 @@ class DeviceIconStore : public BLECharacteristicCallbacks {
                       PIXEL_BYTES) != header.pixelChecksum) {
       if (file) file.close();
       ready_ = false;
+      pixelChecksum_ = 0;
       return false;
     }
     file.close();
     emojiChecksum_ = header.emojiChecksum;
+    pixelChecksum_ = header.pixelChecksum;
     ready_ = true;
     Serial.printf("Device icon restored: %ux%u emoji=%08lx\n", WIDTH,
                   HEIGHT, static_cast<unsigned long>(emojiChecksum_));
@@ -238,6 +242,7 @@ class DeviceIconStore : public BLECharacteristicCallbacks {
   bool storageReady_ = false;
   volatile bool ready_ = false;
   uint32_t emojiChecksum_ = 0;
+  uint32_t pixelChecksum_ = 0;
   File transfer_;
   uint16_t received_ = 0;
   uint32_t runningChecksum_ = 0;
@@ -245,4 +250,3 @@ class DeviceIconStore : public BLECharacteristicCallbacks {
   uint32_t expectedEmojiChecksum_ = 0;
   uint16_t pixels_[WIDTH * HEIGHT] = {};
 };
-

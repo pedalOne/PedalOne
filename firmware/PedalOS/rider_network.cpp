@@ -7,10 +7,13 @@
 namespace {
 constexpr uint16_t RIDER_PACKET_MAGIC = 0x4452;  // "RD" on the wire.
 constexpr uint8_t RIDER_PACKET_VERSION = 1;
+constexpr uint8_t RIDER_ICON_PACKET_VERSION = 2;
 constexpr uint8_t RIDER_FLAG_LOCATION_VALID = 1 << 0;
+constexpr uint8_t RIDER_FLAG_ICON = 1 << 1;
 constexpr uint8_t RIDER_CHANNEL = 6;
 // Avoid locking every rider to exactly the same one-second transmit cadence.
 constexpr uint32_t RIDER_SEND_INTERVAL_MS = 1073;
+constexpr uint32_t RIDER_ICON_SEND_INTERVAL_MS = 5000;
 constexpr uint8_t BROADCAST_ADDRESS[6] = {
     0xff, 0xff, 0xff, 0xff, 0xff, 0xff};
 }
@@ -89,6 +92,8 @@ bool RiderNetwork::start() {
   if (!riderId_) riderId_ = 1;
   nextSequence_ = 0;
   lastSendMs_ = 0;
+  lastIconSendMs_ = 0;
+  lastIconChecksum_ = 0;
   active_ = true;
   Serial.printf("RiDar enabled: id=%08lx channel=%u LR=250K RX=continuous TX=20dBm\n",
                 static_cast<unsigned long>(riderId_), RIDER_CHANNEL);
@@ -114,9 +119,11 @@ void RiderNetwork::receiveCallback(const esp_now_recv_info_t *info,
                                    const uint8_t *data, int length) {
   RiderNetwork *self = instance_;
   if (!self || !self->receiveQueue_ || !info || !data ||
-      length != int(sizeof(Packet))) return;
+      (length != int(sizeof(Packet)) && length != int(sizeof(IconPacket))))
+    return;
   ReceivedPacket received{};
-  memcpy(&received.packet, data, sizeof(received.packet));
+  received.length = uint16_t(length);
+  memcpy(received.data, data, size_t(length));
   received.rssi = info->rx_ctrl ? info->rx_ctrl->rssi : 0;
   xQueueSend(self->receiveQueue_, &received, 0);
 }
@@ -140,7 +147,39 @@ void RiderNetwork::makeCallSign(const String &nickname, char output[4]) const {
 }
 
 bool RiderNetwork::accept(const ReceivedPacket &received, uint32_t now) {
-  const Packet &packet = received.packet;
+  if (received.length == sizeof(IconPacket)) {
+    IconPacket icon{};
+    memcpy(&icon, received.data, sizeof(icon));
+    if (icon.magic != RIDER_PACKET_MAGIC ||
+        icon.version != RIDER_ICON_PACKET_VERSION ||
+        !(icon.flags & RIDER_FLAG_ICON) || !icon.riderId ||
+        icon.riderId == riderId_ ||
+        (icon.checksum &&
+         (icon.width != ICON_WIDTH || icon.height != ICON_HEIGHT)))
+      return false;
+    Rider *slot = nullptr;
+    Rider *oldest = &riders_[0];
+    for (Rider &rider : riders_) {
+      if (rider.id == icon.riderId) { slot = &rider; break; }
+      if (!rider.id && !slot) slot = &rider;
+      if (rider.lastSeenMs < oldest->lastSeenMs) oldest = &rider;
+    }
+    if (!slot) slot = oldest;
+    if (slot->id != icon.riderId) *slot = {};
+    slot->id = icon.riderId;
+    const bool changed = slot->iconChecksum != icon.checksum ||
+                         slot->iconAvailable != bool(icon.checksum);
+    slot->iconChecksum = icon.checksum;
+    slot->iconAvailable = icon.checksum != 0;
+    if (slot->iconAvailable)
+      memcpy(slot->iconPixels, icon.pixels, sizeof(slot->iconPixels));
+    else
+      memset(slot->iconPixels, 0, sizeof(slot->iconPixels));
+    return changed;
+  }
+  if (received.length != sizeof(Packet)) return false;
+  Packet packet{};
+  memcpy(&packet, received.data, sizeof(packet));
   if (packet.magic != RIDER_PACKET_MAGIC ||
       packet.version != RIDER_PACKET_VERSION ||
       !(packet.flags & RIDER_FLAG_LOCATION_VALID) ||
@@ -157,6 +196,7 @@ bool RiderNetwork::accept(const ReceivedPacket &received, uint32_t now) {
     if (rider.lastSeenMs < oldest->lastSeenMs) oldest = &rider;
   }
   if (!slot) slot = oldest;
+  if (slot->id != packet.riderId) *slot = {};
   slot->id = packet.riderId;
   memcpy(slot->callSign, packet.callSign, 4);
   slot->callSign[4] = 0;
@@ -170,9 +210,44 @@ bool RiderNetwork::accept(const ReceivedPacket &received, uint32_t now) {
   return true;
 }
 
+bool RiderNetwork::sendIcon(const uint16_t *pixels, uint8_t width,
+                            uint8_t height, uint32_t checksum,
+                            uint32_t now) {
+  IconPacket packet{};
+  packet.magic = RIDER_PACKET_MAGIC;
+  packet.version = RIDER_ICON_PACKET_VERSION;
+  packet.flags = RIDER_FLAG_ICON;
+  packet.riderId = riderId_;
+  packet.checksum = checksum;
+  if (pixels && checksum && width && height) {
+    packet.width = ICON_WIDTH;
+    packet.height = ICON_HEIGHT;
+    for (uint8_t y = 0; y < ICON_HEIGHT; ++y) {
+      const uint8_t sourceY = uint8_t((uint16_t(y) * height) / ICON_HEIGHT);
+      for (uint8_t x = 0; x < ICON_WIDTH; ++x) {
+        const uint8_t sourceX = uint8_t((uint16_t(x) * width) / ICON_WIDTH);
+        const uint16_t color = pixels[uint16_t(sourceY) * width + sourceX];
+        const uint8_t red = uint8_t((color >> 13) & 0x07);
+        const uint8_t green = uint8_t((color >> 8) & 0x07);
+        const uint8_t blue = uint8_t((color >> 3) & 0x03);
+        packet.pixels[uint16_t(y) * ICON_WIDTH + x] =
+            uint8_t((red << 5) | (green << 2) | blue);
+      }
+    }
+  }
+  const esp_err_t sent = esp_now_send(
+      BROADCAST_ADDRESS, reinterpret_cast<uint8_t *>(&packet), sizeof(packet));
+  if (sent != ESP_OK) return false;
+  lastIconSendMs_ = now ? now : 1;
+  lastIconChecksum_ = checksum;
+  return true;
+}
+
 bool RiderNetwork::service(bool wifiClaimed, bool locationValid,
                            int32_t latitudeE7, int32_t longitudeE7,
-                           const String &nickname, uint32_t now) {
+                           const String &nickname, const uint16_t *iconPixels,
+                           uint8_t iconWidth, uint8_t iconHeight,
+                           uint32_t iconChecksum, uint32_t now) {
   bool changed = false;
   if (!enabled_) {
     if (active_) stop(wifiClaimed);
@@ -214,6 +289,11 @@ bool RiderNetwork::service(bool wifiClaimed, bool locationValid,
                                         sizeof(packet));
     if (sent == ESP_OK) lastSendMs_ = now;
   }
+  const bool iconChanged = iconChecksum != lastIconChecksum_;
+  if ((iconChecksum || lastIconChecksum_) &&
+      (iconChanged || !lastIconSendMs_ ||
+       uint32_t(now - lastIconSendMs_) >= RIDER_ICON_SEND_INTERVAL_MS))
+    sendIcon(iconPixels, iconWidth, iconHeight, iconChecksum, now);
   return changed;
 }
 

@@ -3,6 +3,7 @@ GpxPoint gpxLivePosition = {};
 GpxPoint gpxNearestCoursePoint = {};
 float gpxLastProgress=-1,gpxRecoveryProgress=0,gpxLiveBearing=NAN;
 float gpxOffCourseStartRideMeters=-1,gpxOffCourseStartProgress=0;
+uint32_t gpxOffCourseSinceMs=0;
 gpx::Guidance gpxGuidance;
 gpx::TurnPreview gpxTurnPreview;
 gpx::GuidancePageAlert gpxPageAlert;
@@ -338,7 +339,6 @@ void drawGpxRoute(float meters, bool demo, bool hasFix, float offset) {
   // Redraw guidance over the shaded map using the same hierarchy as demo mode.
   // The compact map clock occupies the very top of the round display. Keep
   // the large maneuver distance below it with a deliberate visual gap.
-  drawClock(millis(),us(10),2);
   textCentered(arrived ? "ARRIVED" : distance,CENTER,58,5,arrived ? GREEN : guidanceColor);
   if(guidance) {
     drawGpxDirectionArrow(gpx::wrapAngle(gpx::pointBearing(position,target)-bearing),guidanceColor);
@@ -438,8 +438,10 @@ void updateGpxPosition(uint32_t now) {
   if(!wasOffCourse && gpxGuidance.offCourse) {
     gpxOffCourseStartRideMeters=distanceMiles*1609.344f;
     gpxOffCourseStartProgress=previous;
+    gpxOffCourseSinceMs=now;
   } else if(wasOffCourse && !gpxGuidance.offCourse) {
     gpxOffCourseStartRideMeters=-1;
+    gpxOffCourseSinceMs=0;
   }
   // Freeze ordered progress while off course or riding the route backwards.
   // Rejoining within the forward window advances directly to that point.
@@ -530,6 +532,55 @@ void drawRidarRoute(const GpxPoint &mapCenter,float bearing,float mapScale) {
   }
 }
 
+uint16_t ridarRgb332To565(uint8_t color) {
+  const uint8_t red=(color>>5)&0x07;
+  const uint8_t green=(color>>2)&0x07;
+  const uint8_t blue=color&0x03;
+  return uint16_t((uint16_t(red*31/7)<<11) |
+                  (uint16_t(green*63/7)<<5) |
+                  uint16_t(blue*31/3));
+}
+
+void drawRidarPeerEmoji(int centerX,int centerY,const uint8_t *pixels) {
+  if(!pixels)return;
+  const int scale=max(1,us(1));
+  const int width=RiderNetwork::ICON_WIDTH*scale;
+  const int height=RiderNetwork::ICON_HEIGHT*scale;
+  canvas->fillCircle(centerX,centerY,max(width,height)/2+us(2),BLACK);
+  const int left=centerX-width/2;
+  const int top=centerY-height/2;
+  for(uint8_t y=0;y<RiderNetwork::ICON_HEIGHT;++y) {
+    for(uint8_t x=0;x<RiderNetwork::ICON_WIDTH;++x) {
+      const uint8_t color=pixels[uint16_t(y)*RiderNetwork::ICON_WIDTH+x];
+      if(!color)continue;
+      canvas->fillRect(left+x*scale,top+y*scale,scale,scale,
+                       ridarRgb332To565(color));
+    }
+  }
+}
+
+void drawRidarLocalEmoji(int centerX,int centerY) {
+  if(!deviceIcon.availableFor(deviceEmoji))return;
+  const int scale=max(1,us(1));
+  const int width=RiderNetwork::ICON_WIDTH*scale;
+  const int height=RiderNetwork::ICON_HEIGHT*scale;
+  canvas->fillCircle(centerX,centerY,max(width,height)/2+us(2),BLACK);
+  const int left=centerX-width/2;
+  const int top=centerY-height/2;
+  const uint16_t *pixels=deviceIcon.pixels();
+  for(uint8_t y=0;y<RiderNetwork::ICON_HEIGHT;++y) {
+    const uint8_t sourceY=uint8_t(
+        (uint16_t(y)*deviceIcon.height())/RiderNetwork::ICON_HEIGHT);
+    for(uint8_t x=0;x<RiderNetwork::ICON_WIDTH;++x) {
+      const uint8_t sourceX=uint8_t(
+          (uint16_t(x)*deviceIcon.width())/RiderNetwork::ICON_WIDTH);
+      const uint16_t color=pixels[uint16_t(sourceY)*deviceIcon.width()+sourceX];
+      if(color==BLACK)continue;
+      canvas->fillRect(left+x*scale,top+y*scale,scale,scale,color);
+    }
+  }
+}
+
 void drawRidarPage(uint32_t now) {
   if(!ridarEnabled) {
     beginFrame();
@@ -553,7 +604,7 @@ void drawRidarPage(uint32_t now) {
     return;
   }
 
-  struct ScreenRider { RiderNetwork::Rider rider; GpxPoint position; };
+  struct ScreenRider { GpxPoint position; };
   RiderNetwork::Rider snapshot[RiderNetwork::MAX_RIDERS]{};
   ScreenRider riders[RiderNetwork::MAX_RIDERS]{};
   const size_t riderCount=riderNetwork.snapshot(
@@ -565,7 +616,7 @@ void drawRidarPage(uint32_t now) {
     const float east=gpx::longitudeDelta(
         gpx::lon0,snapshot[i].longitudeE7*1e-7)*gpx::RAD*gpx::EARTH*gpx::lonScale;
     const float north=(snapshot[i].latitudeE7*1e-7-gpx::lat0)*gpx::RAD*gpx::EARTH;
-    riders[i]={snapshot[i],{east,north,0}};
+    riders[i]={{east,north,0}};
     const float deltaEast=east-gpxLivePosition.east;
     const float deltaNorth=north-gpxLivePosition.north;
     const float right=deltaEast*cosine-deltaNorth*sine;
@@ -605,26 +656,33 @@ void drawRidarPage(uint32_t now) {
   if(!drawSharedRoadMap(mapCenter,bearing,mapScale))return;
   drawRidarRoute(mapCenter,bearing,mapScale);
 
-  const auto drawMarker=[&](const GpxPoint &point,const char *name,
-                            uint16_t color,bool self) {
+  const auto markerPosition=[&](const GpxPoint &point,int &x,int &y) {
     const float east=point.east-mapCenter.east;
     const float north=point.north-mapCenter.north;
-    const int x=CENTER+lroundf((east*cosine-north*sine)*mapScale);
-    const int y=uy(185)-lroundf((east*sine+north*cosine)*mapScale);
-    if(x<18 || x>SCREEN_SIZE-18 || y<18 || y>SCREEN_SIZE-18)return;
-    canvas->fillCircle(x,y,self ? us(11) : us(7),WHITE);
-    canvas->fillCircle(x,y,self ? us(7) : us(5),color);
-    if(name && name[0])textCentered(name,x,y-us(self ? 18 : 14),1,WHITE);
+    x=CENTER+lroundf((east*cosine-north*sine)*mapScale);
+    y=uy(185)-lroundf((east*sine+north*cosine)*mapScale);
+    return x>=18 && x<=SCREEN_SIZE-18 && y>=18 && y<=SCREEN_SIZE-18;
   };
 
   for(size_t i=0;i<riderCount;++i) {
-    const uint32_t age=uint32_t(now-riders[i].rider.lastSeenMs);
-    char signal[8];
-    snprintf(signal,sizeof(signal),"%d",int(riders[i].rider.rssi));
-    drawMarker(riders[i].position,signal,
-               age>8000 ? 0x8410 : GREEN,false);
+    const uint32_t age=uint32_t(now-snapshot[i].lastSeenMs);
+    int x=0,y=0;
+    if(!markerPosition(riders[i].position,x,y))continue;
+    if(snapshot[i].iconAvailable)
+      drawRidarPeerEmoji(x,y,snapshot[i].iconPixels);
+    else {
+      canvas->fillCircle(x,y,us(7),WHITE);
+      canvas->fillCircle(x,y,us(5),age>8000 ? 0x8410 : GREEN);
+    }
   }
-  drawMarker(gpxLivePosition,"YOU",0x039F,true);
+  int selfX=0,selfY=0;
+  if(markerPosition(gpxLivePosition,selfX,selfY)) {
+    if(deviceIcon.availableFor(deviceEmoji))drawRidarLocalEmoji(selfX,selfY);
+    else {
+      canvas->fillCircle(selfX,selfY,us(11),WHITE);
+      canvas->fillCircle(selfX,selfY,us(7),0x039F);
+    }
+  }
 
   char title[24];
   snprintf(title,sizeof(title),"RiDar  %u",unsigned(riderCount));

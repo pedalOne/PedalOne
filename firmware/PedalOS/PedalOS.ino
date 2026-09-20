@@ -76,6 +76,7 @@ constexpr uint32_t POWER_BUTTON_GPS_BACKUP_HOLD_MS = 750;
 #endif
 constexpr uint32_t AUTO_POWER_OFF_MS = (PEDALONE_POWER_TEST ? 1UL : 5UL) * 60UL * 1000UL;
 constexpr uint32_t HARD_POWER_OFF_MS = (PEDALONE_POWER_TEST ? 5UL : 90UL) * 60UL * 1000UL;
+constexpr uint32_t OFF_COURSE_FLASH_MS = 3UL * 60UL * 1000UL;
 constexpr float AUTO_SAVE_RIDE_MIN_MILES = 2.0f;
 // The ten-minute inactive transition already happened when either sleep tier
 // starts, so this timer covers only the remaining time to true power-off.
@@ -106,7 +107,7 @@ constexpr uint16_t LOGO_CYAN = 0x067F;  // #00CFFF
 
 constexpr char BLE_DEVICE_NAME[] = "PedalOne";
 constexpr char LEGACY_BLE_DEVICE_NAME[] = "RAC9000";
-constexpr char FW_VERSION[] = "2.1.95";
+constexpr char FW_VERSION[] = "2.1.96";
 constexpr uint32_t CPU_IDLE_MHZ = 80;
 constexpr uint32_t CPU_BOOST_MHZ = 160;
 constexpr uint32_t CPU_TOUCH_BOOST_MS = 1500;
@@ -2212,10 +2213,13 @@ void drawConfirmation(uint32_t now) {
 void drawBluetoothPage(uint32_t now) {
   beginFrame();drawHeader(now);
   textCentered("Bluetooth",CENTER,uy(80),4,WHITE);
-  canvas->fillRoundRect(ux(55),uy(112),us(130),us(46),us(23),bluetoothEnabled ? GREEN : 0x4208);
-  canvas->fillCircle(ux(bluetoothEnabled ? 163 : 77),uy(135),us(18),WHITE);
-  textCentered("OFF",ux(29),uy(135),2,WHITE);
-  textCentered("ON",ux(211),uy(135),2,WHITE);
+  // Keep the ON/OFF labels outside a compact switch while retaining the
+  // full-width page hit target used by the touch handler.
+  canvas->fillRoundRect(ux(70),uy(114),us(100),us(42),us(21),
+                        bluetoothEnabled ? GREEN : 0x4208);
+  canvas->fillCircle(ux(bluetoothEnabled ? 149 : 91),uy(135),us(17),WHITE);
+  textCentered("OFF",ux(45),uy(135),2,WHITE);
+  textCentered("ON",ux(195),uy(135),2,WHITE);
   endFrame();
 }
 
@@ -2239,11 +2243,11 @@ void drawCountdown(uint32_t now) {
   const int number = max(1, 3 - int(elapsed / 1000));
   const float remaining = 1.0f - elapsed / 3000.0f;
   const float sweep = 359.0f * remaining;
-  // Push the countdown almost to the round panel's edge, while reserving the
-  // narrow lower crescent for the cancel hint.
-  const int centerY = uy(107);
-  const int outerRadius = us(107);
-  const int innerRadius = us(94);
+  // Use the full round face for the countdown. The cancel hint now lives
+  // inside the ring instead of occupying a separate lower crescent.
+  const int centerY = CENTER;
+  const int outerRadius = us(116);
+  const int innerRadius = us(103);
   const int middleRadius = (outerRadius + innerRadius) / 2;
   const int capRadius = max(2, (outerRadius - innerRadius) / 2);
   constexpr uint16_t countdownTrack = 0x0300;
@@ -2276,7 +2280,7 @@ void drawCountdown(uint32_t now) {
   canvas->setCursor(CENTER - (x1 + int(width) / 2),
                     centerY - (y1 + int(height) / 2));
   canvas->print(text);
-  textCentered("2s press to cancel", CENTER, uy(229), 1, WHITE);
+  textCentered("2s press to cancel", CENTER, uy(201), 1, WHITE);
   endAnimatedFrame();
 }
 
@@ -2603,10 +2607,17 @@ void drawRidePage(uint32_t now) {
   drawHeader(now);
   if (currentPage == 0) {
     drawAnimatedSpeedArcPage(now, seconds);
-    if(routeNavigationEnabled && !gpxArrived && gpxGuidance.mode()==gpx::OFF_COURSE &&
-       (now%1000)<500) {
-      canvas->fillRect(ux(48),uy(65),us(144),us(26),0xF81F);
-      textCentered("OFF COURSE",CENTER,uy(78),3,WHITE);
+    if(routeNavigationEnabled && !gpxArrived &&
+      gpxGuidance.mode()==gpx::OFF_COURSE) {
+      if(!gpxOffCourseSinceMs) gpxOffCourseSinceMs=now;
+      constexpr uint16_t offCourseColor=0xF81F;
+      const bool initialFlash=now-gpxOffCourseSinceMs<OFF_COURSE_FLASH_MS;
+      if(initialFlash && (now%1000)<500) {
+        canvas->fillRect(ux(48),uy(65),us(144),us(26),offCourseColor);
+        textCentered("OFF COURSE",CENTER,uy(78),3,WHITE);
+      } else if(!initialFlash) {
+        textCentered("OFF COURSE",CENTER,uy(76),2,offCourseColor);
+      }
     }
   } else {
     // Three large, vertically spaced values fit inside the round display.
@@ -3110,6 +3121,7 @@ void startRide(uint32_t now) {
   gpxPageAlert.reset();gpxArrived=false;
   gpxLastProgress=-1;gpxRecoveryProgress=0;gpxLiveBearing=NAN;
   gpxOffCourseStartRideMeters=-1;gpxOffCourseStartProgress=0;
+  gpxOffCourseSinceMs=0;
   gpxGuidance.reset();gpxFixReceived=0;
   appState = RIDING; currentPage = 0; currentSpeedMph = 0;
   ridePaused = false; ridePausedAtMs = 0;
@@ -4751,6 +4763,7 @@ void loop() {
     gpxLibrary.changed=false; gpxSimulation.reset(now);
     gpxLastProgress=-1;gpxRecoveryProgress=0;gpxLiveBearing=NAN;
     gpxOffCourseStartRideMeters=-1;gpxOffCourseStartProgress=0;
+    gpxOffCourseSinceMs=0;
     gpxGuidance.reset();gpxFixReceived=0;
     previousDrawMs=0;
   }
@@ -4767,10 +4780,15 @@ void loop() {
       ridarLocation.latitudeE7>=-850000000 && ridarLocation.latitudeE7<=850000000 &&
       ridarLocation.longitudeE7>=-1800000000 && ridarLocation.longitudeE7<=1800000000;
   riderNetwork.setEnabled(ridarEnabled);
+  const bool ridarIconAvailable=deviceIcon.availableFor(deviceEmoji);
   const bool ridersChanged=riderNetwork.service(
       wifiConfig.busy() || otaUpdate.active() || otaUpdate.rebootPending(),
       ridarLocationValid,ridarLocation.latitudeE7,ridarLocation.longitudeE7,
-      deviceNickname,now);
+      deviceNickname,
+      ridarIconAvailable ? deviceIcon.pixels() : nullptr,
+      ridarIconAvailable ? deviceIcon.width() : 0,
+      ridarIconAvailable ? deviceIcon.height() : 0,
+      ridarIconAvailable ? deviceIcon.pixelChecksum() : 0,now);
   if(ridersChanged && appState==RIDING && currentPage==RIDAR_PAGE_INDEX)
     previousDrawMs=0;
   if (otaUpdate.active() || otaUpdate.rebootPending()) {
