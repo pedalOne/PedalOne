@@ -8,10 +8,12 @@ const UUID = {
     "0000ffe0-0000-1000-8000-00805f9b34fb",
   ],
   write: [
+    "0000fff2-0000-1000-8000-00805f9b34fb",
     "0000ae01-0000-1000-8000-00805f9b34fb",
     "0000fff3-0000-1000-8000-00805f9b34fb",
   ],
   notify: [
+    "0000fff1-0000-1000-8000-00805f9b34fb",
     "0000ae02-0000-1000-8000-00805f9b34fb",
     "0000fff4-0000-1000-8000-00805f9b34fb",
   ],
@@ -159,6 +161,7 @@ async function connectDevice(device) {
   if (!state.writeCharacteristic || !state.notifyCharacteristic) {
     throw new Error("No writable/notifiable UART characteristics were found.");
   }
+  log(`Selected UART write ${state.writeCharacteristic.uuid}; notify ${state.notifyCharacteristic.uuid}.`);
 
   state.notifyCharacteristic.addEventListener("characteristicvaluechanged", onNotification);
   await state.notifyCharacteristic.startNotifications();

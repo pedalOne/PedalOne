@@ -17,6 +17,12 @@ On macOS, allow Bluetooth access when prompted. Power the radar, click **Scan**,
 
 If the radar is absent from the list, force-quit HLKRadarTool and temporarily turn off Bluetooth on nearby phones that have used it, power-cycle the LD2451, and scan again. In macOS **System Settings → Privacy & Security → Bluetooth**, make sure Python or the terminal application used to launch it is enabled. The scan runs for 12 seconds and shows all advertisements; a star marks named LD2451 devices and unnamed devices advertising an AE00/AE30 service.
 
+For a raw scan that bypasses every UI filter:
+
+```sh
+.venv/bin/python ble_scan_debug.py --seconds 20
+```
+
 Preview the interface without hardware:
 
 ```sh
@@ -45,8 +51,8 @@ The **Start CSV log** button records timestamped target rows for later analysis.
 
 ## BLE compatibility note
 
-The tool first looks for the AE01 write and AE02 notify characteristics used by the vendor Android source, then falls back to FFF3/FFF4 and finally to discovered writable/notifiable characteristics. It logs the complete GATT inventory after connection.
+The LD2451 vendor demo uses the FFF0 service with FFF2 for writes and FFF1 for notifications. The tool prefers that channel, then falls back to the AE01/AE02 OTA channel and finally to discovered writable/notifiable characteristics. It logs the complete GATT inventory after connection.
 
-Hi-Link documents the UART framing and configuration commands, but has not published a complete BLE transport/authentication protocol. Some firmware advertises the AE service and accepts notification subscription yet sends no frames until an undocumented authorization/start exchange occurs. If that happens, the log will say that the tool is waiting for notifications. Capturing the official app's first AE01 write on that specific firmware is necessary; the raw log and GATT inventory are included to make that diagnosis clear rather than guessing a potentially destructive command.
+The FFF1/FFF2 channel carries the documented UART frames directly. AE00/AE01/AE02 may also appear in the GATT inventory, but Hi-Link's official source assigns that channel to the LD2450/OTA path rather than normal LD2451 target data.
 
 Protocol reference: https://make.net.za/wp-content/datasheets/HLK%20LD2451%20Serial%20Communication%20Protocol%20v1.03.pdf

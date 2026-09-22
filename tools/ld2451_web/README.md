@@ -22,4 +22,4 @@ Then open `http://localhost:8765` in Chrome. Browsers treat localhost as a secur
 
 The app decodes target angle, range, direction, speed, SNR, alarm state, detection settings, sensitivity settings, and firmware information. It shows all raw notification and acknowledgement bytes in the protocol log and can download target reports as CSV.
 
-BLE candidates: AE00/AE30/FFF0/FFE0 services, AE01/FFF3 write characteristics, and AE02/FFF4 notification characteristics.
+The LD2451 vendor demo uses the FFF0 service, FFF2 write characteristic, and FFF1 notification characteristic. AE00/AE01/AE02 and FFF3/FFF4 remain compatibility fallbacks for other firmware variants.

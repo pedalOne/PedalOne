@@ -68,10 +68,12 @@ from ld2451_protocol import (
 
 
 WRITE_UUIDS = (
+    "0000fff2-0000-1000-8000-00805f9b34fb",
     "0000ae01-0000-1000-8000-00805f9b34fb",
     "0000fff3-0000-1000-8000-00805f9b34fb",
 )
 NOTIFY_UUIDS = (
+    "0000fff1-0000-1000-8000-00805f9b34fb",
     "0000ae02-0000-1000-8000-00805f9b34fb",
     "0000fff4-0000-1000-8000-00805f9b34fb",
 )
@@ -186,6 +188,10 @@ class BleWorker:
             self.events.put(("gatt", inventory))
             if not self.write_uuid or not notify_uuid:
                 raise RuntimeError("no writable/notifiable UART characteristics found")
+            self.events.put((
+                "diagnostic",
+                f"Selected UART write {self.write_uuid}; notify {notify_uuid}",
+            ))
             await self.client.start_notify(notify_uuid, self._notification)
             self.events.put(("connected", str(self.client.address)))
         except Exception as exc:
@@ -375,11 +381,11 @@ class App(QMainWindow):
         self.device_box = QComboBox()
         self.device_box.setMinimumWidth(320)
         toolbar.addWidget(self.device_box)
-        self.hlk_filter = QCheckBox("HLK* only")
+        self.hlk_filter = QCheckBox("LD2451 / HLK only")
         self.hlk_filter.setChecked(True)
         self.hlk_filter.setToolTip(
-            "Show only devices whose advertised name starts with HLK. "
-            "Uncheck and rescan for firmware advertising as LD2451_XXXX."
+            "Show only likely LD2451 radar advertisements. "
+            "Uncheck to inspect every BLE advertisement."
         )
         toolbar.addWidget(self.hlk_filter)
         connect = QPushButton("Connect")
@@ -516,11 +522,17 @@ class App(QMainWindow):
                         "LD2451" in name.upper()
                         or any("ae00" in uuid or "ae30" in uuid for uuid in services)
                     )
-                    if self.hlk_filter.isChecked() and not name.upper().startswith("HLK"):
+                    name_upper = name.upper()
+                    visible_radar = (
+                        name_upper.startswith("HLK")
+                        or "LD2451" in name_upper
+                        or likely_radar
+                    )
+                    if self.hlk_filter.isChecked() and not visible_radar:
                         if likely_radar and address not in self.diagnostic_addresses:
                             self.diagnostic_addresses.add(address)
                             self._append_log(
-                                f"Radar-like advertisement filtered by HLK*: {name}, "
+                                f"Radar-like advertisement filtered: {name}, "
                                 f"{address}, {rssi} dBm, services: "
                                 + (", ".join(services) if services else "not advertised")
                             )
@@ -549,18 +561,18 @@ class App(QMainWindow):
                 elif kind == "scan_done":
                     visible = len(self.device_map)
                     if visible:
-                        noun = "HLK device" if self.hlk_filter.isChecked() else "BLE device"
+                        noun = "radar device" if self.hlk_filter.isChecked() else "BLE device"
                         self._set_status(
                             f"Scan complete — showing {visible} {noun}(s); {value} total seen"
                         )
                     elif value and self.hlk_filter.isChecked():
                         self._set_status(
-                            f"No HLK* advertisements — {value} other BLE device(s) seen"
+                            f"No LD2451/HLK advertisements — {value} other BLE device(s) seen"
                         )
                         self._append_log(
-                            "No advertised name began with HLK. Uncheck ‘HLK* only’, "
-                            "power-cycle the radar, and scan again; some firmware uses "
-                            "LD2451_XXXX instead."
+                            "No LD2451/HLK advertisement was found. Force-quit "
+                            "HLKRadarTool, power-cycle the radar, wait five seconds, "
+                            "and scan again."
                         )
                     else:
                         self._set_status(
@@ -572,7 +584,7 @@ class App(QMainWindow):
                         )
                 elif kind == "connected":
                     self._set_status(f"Connected: {value}")
-                    self._append_log("Connected. Waiting for AE02 notifications…")
+                    self._append_log("Connected. Waiting for FFF1 radar notifications…")
                     self.rx_seen = False
                     QTimer.singleShot(350, lambda: self._config_sequence(
                         [(0x0012, b""), (0x0013, b""), (0x00A0, b"")]))
@@ -596,8 +608,8 @@ class App(QMainWindow):
     def _check_for_silent_ble(self) -> None:
         if not self.rx_seen and self.status_label.text().startswith("Connected"):
             self._set_status("Connected, but no notifications — see protocol log")
-            self._append_log("No AE02 data received. This firmware may require the "
-                             "vendor app's undocumented authorization/start write.")
+            self._append_log("No FFF1 radar data received. Check the GATT inventory "
+                             "for FFF0/FFF1/FFF2 and power-cycle the radar.")
 
     def _consume(self, data: bytes) -> None:
         for frame in self.stream.feed(data):
