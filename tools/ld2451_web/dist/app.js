@@ -305,6 +305,15 @@ function findHeader(buffer, header) {
 
 function parseReport(frame) {
   const body = frame.slice(6, -4);
+  uartLog(`RX TARGET ${hex(frame)}`);
+  if (!body.length) {
+    state.alarm = false;
+    state.targets = [];
+    uartLog("REPORT clear · no targets · alarm=0");
+    updateTargets();
+    return;
+  }
+  if (body.length < 2) { log("Ignored malformed target report."); return; }
   const count = body[0];
   if (body.length !== 2 + count * 5) { log("Ignored malformed target report."); return; }
   state.alarm = Boolean(body[1]);
@@ -319,7 +328,6 @@ function parseReport(frame) {
       snr: body[offset + 4],
     });
   }
-  uartLog(`RX TARGET ${hex(frame)}`);
   if (!state.targets.length) {
     uartLog(`REPORT clear · no targets · alarm=${state.alarm ? 1 : 0}`);
   } else {

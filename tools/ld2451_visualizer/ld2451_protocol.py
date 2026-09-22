@@ -53,11 +53,16 @@ def build_command(command: int, value: bytes = b"") -> bytes:
 
 
 def parse_report(frame: bytes) -> Report:
-    if len(frame) < 12 or not frame.startswith(REPORT_HEADER) or not frame.endswith(REPORT_TAIL):
+    if len(frame) < 10 or not frame.startswith(REPORT_HEADER) or not frame.endswith(REPORT_TAIL):
         raise ValueError("not an LD2451 report frame")
     data_length = int.from_bytes(frame[4:6], "little")
     body = frame[6:-4]
-    if len(body) != data_length or len(body) < 2:
+    if len(body) != data_length:
+        raise ValueError("invalid report length")
+    # LD2451 sends a zero-length report as its idle/no-target heartbeat.
+    if not body:
+        return Report(False, ())
+    if len(body) < 2:
         raise ValueError("invalid report length")
     count, alarm = body[0], body[1]
     if len(body) != 2 + count * 5:
@@ -117,4 +122,3 @@ class FrameStream:
             frames.append(candidate)
             del self.buffer[:total]
         return frames
-

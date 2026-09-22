@@ -29,6 +29,16 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(parsed.command, 0x12)
         self.assertEqual(parsed.payload, bytes((100, 1, 5, 2)))
 
+    def test_zero_length_report_is_no_target_heartbeat(self):
+        frame = bytes.fromhex("F4 F3 F2 F1 00 00 F8 F7 F6 F5")
+        report = parse_report(frame)
+        self.assertFalse(report.alarm)
+        self.assertEqual(report.targets, ())
+
+        stream = FrameStream()
+        self.assertEqual(stream.feed(frame[:6]), [])
+        self.assertEqual(stream.feed(frame[6:]), [frame])
+
     def test_build_enable_configuration(self):
         self.assertEqual(
             build_command(0x00FF, b"\x01\x00"),
@@ -38,4 +48,3 @@ class ProtocolTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-
