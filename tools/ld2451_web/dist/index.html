@@ -1,0 +1,108 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#07111f">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <title>LD2451 Radar</title>
+  <meta name="description" content="Live LD2451 BLE radar view and configuration panel.">
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%2307111f'/%3E%3Cpath d='M32 9 8 54h48Z' fill='none' stroke='%2323d5ab' stroke-width='5'/%3E%3Ccircle cx='32' cy='18' r='5' fill='%23ffcf56'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="brand-mark" aria-hidden="true"></span>
+      <div><strong>LD2451</strong><span>Radar console</span></div>
+    </div>
+    <div id="status" class="status" data-state="idle"><i></i><span>Ready to connect</span></div>
+  </header>
+
+  <main class="workspace">
+    <section class="radar-card" aria-labelledby="radar-title">
+      <div class="card-heading">
+        <div>
+          <p class="eyebrow">Live field</p>
+          <h1 id="radar-title">Rear radar</h1>
+        </div>
+        <div class="alarm" id="alarmBadge"><i></i><span>Clear</span></div>
+      </div>
+
+      <div class="radar-wrap">
+        <canvas id="radarCanvas" aria-label="Radar target plot with the bicycle at the top"></canvas>
+        <div class="self-marker" aria-hidden="true"><span></span><small>YOU</small></div>
+        <div id="emptyRadar" class="empty-radar">
+          <strong>No target data</strong>
+          <span>Connect to your radar or start demo mode</span>
+        </div>
+      </div>
+
+      <div class="legend" aria-label="Speed color legend">
+        <span><i class="slow"></i>0–19 km/h</span>
+        <span><i class="medium"></i>20–44 km/h</span>
+        <span><i class="fast"></i>45+ km/h</span>
+      </div>
+
+      <div class="targets" id="targetCards" aria-live="polite">
+        <div class="target-empty">Waiting for targets</div>
+      </div>
+    </section>
+
+    <aside class="control-column">
+      <section class="panel connect-panel">
+        <div class="panel-title">
+          <div><p class="eyebrow">Bluetooth</p><h2>Connection</h2></div>
+          <button id="disconnectButton" class="icon-button" type="button" disabled aria-label="Disconnect radar">×</button>
+        </div>
+        <div class="button-grid">
+          <button id="connectButton" class="button primary" type="button"><span>Connect HLK radar</span></button>
+          <button id="allDevicesButton" class="button secondary" type="button">Show all BLE devices</button>
+        </div>
+        <p id="browserHint" class="hint">In Bluefy, tap Connect and choose the LD2451 or HLK device.</p>
+        <div class="uart-console" aria-label="BLE UART target messages">
+          <header>
+            <span>BLE UART</span>
+            <span id="uartHealth" class="uart-health" data-state="idle"><i></i><b>No data</b></span>
+          </header>
+          <pre id="uartTerminal" aria-live="polite">Waiting for a radar connection…</pre>
+        </div>
+      </section>
+
+      <section class="panel settings-panel">
+        <div class="panel-title">
+          <div><p class="eyebrow">Device</p><h2>Detection settings</h2></div>
+          <span id="firmware" class="firmware">Firmware —</span>
+        </div>
+        <div class="settings-table">
+          <label><span>Maximum range<small>10–100 m</small></span><span class="input-unit"><input id="range" type="number" min="10" max="100" value="100"><b>m</b></span></label>
+          <label><span>Direction</span><select id="direction"><option value="0">Approaching</option><option value="1">Moving away</option><option value="2" selected>Both</option></select></label>
+          <label><span>Minimum speed<small>Detection threshold</small></span><span class="input-unit"><input id="minSpeed" type="number" min="0" max="120" value="0"><b>km/h</b></span></label>
+          <label><span>No-target delay<small>Hold time</small></span><span class="input-unit"><input id="holdTime" type="number" min="0" max="255" value="10"><b>s</b></span></label>
+          <label><span>Trigger count</span><input id="triggerCount" type="number" min="1" max="10" value="1"></label>
+          <label><span>SNR threshold<small>0 = device default</small></span><select id="snr"><option value="0">Default</option><option value="3">3</option><option value="4">4</option><option value="5">5</option><option value="6">6</option><option value="7">7</option><option value="8">8</option></select></label>
+        </div>
+        <div class="settings-actions">
+          <button id="readButton" class="button secondary" type="button" disabled>Read from radar</button>
+          <button id="applyButton" class="button primary" type="button" disabled>Apply settings</button>
+        </div>
+      </section>
+
+      <section class="panel data-panel">
+        <details>
+          <summary><span><span class="eyebrow">Diagnostics</span>Protocol log</span><b id="packetCount">0 packets</b></summary>
+          <div class="log-actions">
+            <button id="demoButton" class="text-button" type="button">Start demo</button>
+            <button id="csvButton" class="text-button" type="button">Download CSV</button>
+            <button id="clearButton" class="text-button" type="button">Clear log</button>
+          </div>
+          <pre id="protocolLog" aria-live="polite">Ready.</pre>
+        </details>
+      </section>
+    </aside>
+  </main>
+
+  <script src="app.js"></script>
+</body>
+</html>
