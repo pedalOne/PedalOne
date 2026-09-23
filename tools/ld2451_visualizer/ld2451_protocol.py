@@ -70,7 +70,8 @@ def parse_report(frame: bytes) -> Report:
     targets = []
     for offset in range(2, len(body), 5):
         angle_raw, distance, direction, speed, snr = body[offset : offset + 5]
-        targets.append(Target(angle_raw - 0x80, distance, direction == 0, speed, snr))
+        # Current LD2451 firmware reports 0x01 for approaching and 0x00 for away.
+        targets.append(Target(angle_raw - 0x80, distance, direction == 1, speed, snr))
     return Report(bool(alarm), tuple(targets))
 
 

@@ -323,7 +323,8 @@ function parseReport(frame) {
     state.targets.push({
       angle: body[offset] - 0x80,
       distance: body[offset + 1],
-      approaching: body[offset + 2] === 0,
+      // Current LD2451 firmware reports 0x01 for approaching and 0x00 for away.
+      approaching: body[offset + 2] === 1,
       speed: body[offset + 3],
       snr: body[offset + 4],
     });

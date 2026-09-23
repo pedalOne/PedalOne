@@ -14,8 +14,8 @@ class ProtocolTests(unittest.TestCase):
         self.assertTrue(report.alarm)
         self.assertEqual(len(report.targets), 3)
         self.assertEqual((report.targets[0].angle_deg, report.targets[0].distance_m), (10, 40))
-        self.assertTrue(report.targets[0].approaching)
-        self.assertFalse(report.targets[1].approaching)
+        self.assertFalse(report.targets[0].approaching)
+        self.assertTrue(report.targets[1].approaching)
         self.assertEqual(report.targets[2].angle_deg, -10)
 
     def test_fragmented_stream_and_ack(self):
@@ -38,6 +38,13 @@ class ProtocolTests(unittest.TestCase):
         stream = FrameStream()
         self.assertEqual(stream.feed(frame[:6]), [])
         self.assertEqual(stream.feed(frame[6:]), [frame])
+
+    def test_live_direction_byte_one_is_approaching(self):
+        frame = bytes.fromhex("F4 F3 F2 F1 07 00 01 01 8F 04 01 03 FF F8 F7 F6 F5")
+        report = parse_report(frame)
+        self.assertTrue(report.alarm)
+        self.assertTrue(report.targets[0].approaching)
+        self.assertEqual(report.targets[0].speed_kmh, 3)
 
     def test_build_enable_configuration(self):
         self.assertEqual(
