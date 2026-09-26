@@ -36,17 +36,10 @@ uint32_t read32(const uint8_t *p) {
 
 class AncsServerCallbacks : public BLEServerCallbacks {
   void onConnect(BLEServer *, ble_gap_conn_desc *desc) override {
-    // Arduino-ESP32 forwards every GAP connection to the server callback,
-    // including PedalOne's outgoing central connection to the radar.  ANCS is
-    // valid only when the local device is the peripheral (the phone connected
-    // to us).  Treating the radar as an iPhone starts security and a competing
-    // MTU exchange on its link.
-    if (desc && desc->role == BLE_GAP_ROLE_SLAVE && AncsClient::instance_)
-      AncsClient::instance_->onConnected(desc->conn_handle);
+    if (AncsClient::instance_) AncsClient::instance_->onConnected(desc->conn_handle);
   }
-  void onDisconnect(BLEServer *, ble_gap_conn_desc *desc) override {
-    if (desc && desc->role == BLE_GAP_ROLE_SLAVE && AncsClient::instance_)
-      AncsClient::instance_->onDisconnected();
+  void onDisconnect(BLEServer *, ble_gap_conn_desc *) override {
+    if (AncsClient::instance_) AncsClient::instance_->onDisconnected();
   }
 };
 
@@ -55,7 +48,7 @@ class AncsSecurityCallbacks : public BLESecurityCallbacks {
   bool onConfirmPIN(uint32_t) override { return true; }
   bool onAuthorizationRequest(uint16_t, uint16_t, bool) override { return true; }
   void onAuthenticationComplete(ble_gap_conn_desc *desc) override {
-    if (desc && desc->role == BLE_GAP_ROLE_SLAVE && AncsClient::instance_)
+    if (AncsClient::instance_)
       AncsClient::instance_->onAuthenticated(desc && desc->sec_state.encrypted);
   }
 };
@@ -76,12 +69,6 @@ void AncsClient::begin(const char *deviceName) {
   auto *security = new BLESecurity();
   security->setCapability(ESP_IO_CAP_NONE);
   security->setAuthenticationMode(true, false, true);
-  // Security is global in Arduino-ESP32's BLE wrapper.  Forcing it on every
-  // new connection also attempts to pair with the unencrypted LD2451 client
-  // link, which can tear down or reset the shared NimBLE host.  The phone
-  // server connection is authenticated explicitly in onConnected(), so defer
-  // automatic authentication and leave the radar link unpaired.
-  security->setForceAuthentication(false);
   server_ = BLEDevice::createServer();
   server_->setCallbacks(new AncsServerCallbacks());
   BLEService *bridgeService = server_->createService(kBikeServiceUuid);

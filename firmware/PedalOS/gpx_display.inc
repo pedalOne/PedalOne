@@ -217,10 +217,6 @@ void drawGpxMapReference(float mapScale,float mapBearing) {
   point(-18,-20,leftX,leftY);
   point(0,-10,notchX,notchY);
   point(18,-20,rightX,rightY);
-  // Fill the compass body red, then retain its crisp white outline and needle.
-  // The concave rear notch requires two triangles to follow the chevron.
-  canvas->fillTriangle(tipX,tipY,leftX,leftY,notchX,notchY,RED);
-  canvas->fillTriangle(tipX,tipY,notchX,notchY,rightX,rightY,RED);
   wideLine(tipX,tipY,leftX,leftY,4,WHITE);
   wideLine(leftX,leftY,notchX,notchY,4,WHITE);
   wideLine(notchX,notchY,rightX,rightY,4,WHITE);
@@ -472,119 +468,6 @@ void drawLiveGpxPage(uint32_t now) {
   }
   drawGpxRoute(max(0.0f,gpxLastProgress),false,true,0);
 }
-
-void formatGpxDuration(uint32_t seconds,char *output,size_t bytes,
-                       bool includeSeconds) {
-  if(includeSeconds) {
-    snprintf(output,bytes,"%02lu:%02lu:%02lu",
-             (unsigned long)(seconds/3600),
-             (unsigned long)((seconds/60)%60),
-             (unsigned long)(seconds%60));
-  } else {
-    snprintf(output,bytes,"%lu:%02lu",
-             (unsigned long)(seconds/3600),
-             (unsigned long)((seconds/60)%60));
-  }
-}
-
-void drawGpxComboArrow(float relativeBearing,uint16_t color) {
-  const float sine=sinf(relativeBearing),cosine=cosf(relativeBearing);
-  const float x[]={0,-25,25,-8,8,8,-8};
-  const float y[]={-38,-8,-8,-8,-8,31,31};
-  int px[7],py[7];
-  const int centerY=uy(105);
-  for(int i=0;i<7;++i) {
-    px[i]=CENTER+lroundf(x[i]*cosine-y[i]*sine);
-    py[i]=centerY+lroundf(x[i]*sine+y[i]*cosine);
-  }
-  canvas->fillTriangle(px[0],py[0],px[1],py[1],px[2],py[2],color);
-  canvas->fillTriangle(px[3],py[3],px[4],py[4],px[5],py[5],color);
-  canvas->fillTriangle(px[3],py[3],px[5],py[5],px[6],py[6],color);
-}
-
-void drawGpxComboMiniRoute() {
-  if(!gpxFixAvailable || gpx::count<2)return;
-  const float meters=max(0.0f,gpxLastProgress);
-  const float bearing=std::isfinite(gpxLiveBearing)
-      ? gpxLiveBearing : gpx::heading(meters);
-  const float sine=sinf(bearing),cosine=cosf(bearing);
-  constexpr float scale=1.35f;
-  constexpr uint16_t routeBlue=0x05BF;
-  const int riderY=uy(158);
-  const int left=ux(66),right=ux(174),top=uy(76),bottom=uy(174);
-  bool previousVisible=false;
-  int previousX=0,previousY=0;
-  for(float d=max(0.0f,meters-180.0f);
-      d<=min(gpx::length(),meters+400.0f);d+=4.0f) {
-    const auto point=gpx::sample(d);
-    const float east=point.east-gpxLivePosition.east;
-    const float north=point.north-gpxLivePosition.north;
-    const int x=CENTER+lroundf((east*cosine-north*sine)*scale);
-    const int y=riderY-lroundf((east*sine+north*cosine)*scale);
-    const bool visible=x>=left && x<=right && y>=top && y<=bottom;
-    if(visible && previousVisible)
-      drawSharedMapStroke(previousX,previousY,x,y,2,routeBlue);
-    previousVisible=visible;
-    previousX=x;previousY=y;
-  }
-  canvas->fillCircle(CENTER,riderY,us(7),WHITE);
-  canvas->fillTriangle(CENTER,riderY-us(6),CENTER-us(4),riderY+us(4),
-                       CENTER,riderY+us(2),0x039F);
-  canvas->fillTriangle(CENTER,riderY-us(6),CENTER,riderY+us(2),
-                       CENTER+us(4),riderY+us(4),0x039F);
-}
-
-void drawGpxComboOverlay(uint32_t now,uint32_t seconds) {
-  // Preserve the speed arc, but replace its center and lower metrics with a
-  // nearest-zoom, route-only navigation view.
-  canvas->fillCircle(CENTER,uy(137),us(74),BLACK);
-  canvas->fillRect(ux(27),uy(178),us(186),us(49),BLACK);
-  drawGpxComboMiniRoute();
-
-  const float meters=max(0.0f,gpxLastProgress);
-  const auto mode=gpxArrived ? gpx::ON_ROUTE : gpxGuidance.mode();
-  const auto cue=gpxTurnPreview.active ? gpxTurnPreview.cue
-                                       : gpx::nextCue(meters);
-  const auto target=mode==gpx::TO_START ? gpx::sample(0)
-                                        : gpxNearestCoursePoint;
-  const bool recovery=mode!=gpx::ON_ROUTE;
-  const float remaining=recovery
-      ? gpx::pointDistance(gpxLivePosition,target)
-      : max(0.0f,cue.meters-meters);
-  char distance[20];
-  if(remaining>=160.9344f)
-    snprintf(distance,sizeof(distance),"%.1f mi",remaining/1609.344f);
-  else
-    snprintf(distance,sizeof(distance),"%.0f ft",remaining*3.28084f);
-  textCentered(gpxArrived ? "ARRIVED" : distance,CENTER,uy(67),3,
-               gpxArrived ? GREEN : WHITE);
-  if(!gpxArrived) {
-    const float bearing=std::isfinite(gpxLiveBearing)
-        ? gpxLiveBearing : gpx::heading(meters);
-    const float relative=recovery
-        ? gpx::wrapAngle(gpx::pointBearing(gpxLivePosition,target)-bearing)
-        : cue.angle;
-    drawGpxComboArrow(relative,WHITE);
-  }
-
-  canvas->drawFastHLine(ux(34),uy(181),us(172),0x4208);
-  canvas->drawFastVLine(CENTER,uy(186),uy(39),0x4208);
-  char speed[12],rightValue[20];
-  snprintf(speed,sizeof(speed),"%d",int(roundf(max(0.0f,currentSpeedMph))));
-  textCentered("SPEED",ux(72),uy(190),1,0x8410);
-  textCentered(speed,ux(72),uy(211),5,WHITE);
-  if(((now/2000)&1)==0) {
-    textCentered("TIME",ux(160),uy(190),1,0x8410);
-    formatGpxDuration(seconds,rightValue,sizeof(rightValue),true);
-    textCentered(rightValue,ux(160),uy(211),3,WHITE);
-  } else {
-    textCentered("DISTANCE",ux(160),uy(190),1,0x8410);
-    snprintf(rightValue,sizeof(rightValue),distanceMiles<9.95f
-        ? "%.2f mi" : "%.1f mi",distanceMiles);
-    textCentered(rightValue,ux(160),uy(211),3,WHITE);
-  }
-}
-
 void drawFreeRideMapPage(uint32_t now) {
   float unusedCourse=NAN;
   updateGpxLiveFix(now,unusedCourse);
