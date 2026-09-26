@@ -351,11 +351,13 @@ void OnboardGps::service(uint32_t now) {
   }
   serviceAdaptiveRate(millis());
   now=millis();
-  if(now-lastDiagnosticMs_>=5000 && Serial && Serial.availableForWrite()>=160) {
+  if(now-lastDiagnosticMs_>=5000 && Serial && Serial.availableForWrite()>=192) {
     lastDiagnosticMs_=now;
-    Serial.printf("GPS stage=%u NMEA=%lu ms fix=%u quality=%u sats=%u readErrors=%u\n",
+    Serial.printf("GPS stage=%u NMEA=%lu ms fix=%u quality=%u sats=%u speed=%.2fkn hdop=%.1f readErrors=%u\n",
         unsigned(configStage_), lastNmeaMs_ ? (unsigned long)(now-lastNmeaMs_) : 999999UL,
-        unsigned(fixFresh(now)),unsigned(fixQuality_),unsigned(satellites_),unsigned(readFailures_));
+        unsigned(fixFresh(now)),unsigned(fixQuality_),unsigned(satellites_),
+        isfinite(speedKnots_) ? speedKnots_ : -1.0f,
+        isfinite(hdop_) ? hdop_ : -1.0f,unsigned(readFailures_));
   }
 }
 
