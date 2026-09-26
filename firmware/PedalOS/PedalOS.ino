@@ -41,6 +41,7 @@
 #include "shared_map.h"
 #include "pq_map.h"
 #include "rider_network.h"
+#include "radar_client.h"
 #ifndef PEDALONE_GPX_DEMO_BOOT
 #define PEDALONE_GPX_DEMO_BOOT 0
 #endif
@@ -52,8 +53,9 @@
 constexpr int SCREEN_SIZE = 466;
 constexpr int CENTER = SCREEN_SIZE / 2;
 constexpr float UI_SCALE = SCREEN_SIZE / 240.0f;
-constexpr int PAGE_COUNT = 4;
-constexpr int RIDAR_PAGE_INDEX = gpx::PAGE_INDEX + 1;
+constexpr int RADAR_PAGE_INDEX = gpx::PAGE_INDEX + 1;
+constexpr int RIDAR_PAGE_INDEX = gpx::PAGE_INDEX + 2;
+constexpr int MAX_RIDE_PAGE_COUNT = 6;
 constexpr int BOOT_BUTTON_PIN = 0;
 constexpr uint32_t LONG_PRESS_MS = 1500;
 constexpr int SWIPE_THRESHOLD = 40;
@@ -77,6 +79,10 @@ constexpr uint32_t POWER_BUTTON_GPS_BACKUP_HOLD_MS = 750;
 constexpr uint32_t AUTO_POWER_OFF_MS = (PEDALONE_POWER_TEST ? 1UL : 5UL) * 60UL * 1000UL;
 constexpr uint32_t HARD_POWER_OFF_MS = (PEDALONE_POWER_TEST ? 5UL : 90UL) * 60UL * 1000UL;
 constexpr uint32_t OFF_COURSE_FLASH_MS = 3UL * 60UL * 1000UL;
+constexpr uint32_t AUTO_PAUSE_STATIONARY_MS = 3UL * 60UL * 1000UL;
+constexpr uint32_t AUTO_RESUME_CONFIRM_MS = 2000;
+constexpr float AUTO_PAUSE_MAX_SPEED_MPH = 0.5f;
+constexpr float AUTO_RESUME_MIN_SPEED_MPH = 1.5f;
 constexpr float AUTO_SAVE_RIDE_MIN_MILES = 2.0f;
 // The ten-minute inactive transition already happened when either sleep tier
 // starts, so this timer covers only the remaining time to true power-off.
@@ -107,7 +113,8 @@ constexpr uint16_t LOGO_CYAN = 0x067F;  // #00CFFF
 
 constexpr char BLE_DEVICE_NAME[] = "PedalOne";
 constexpr char LEGACY_BLE_DEVICE_NAME[] = "RAC9000";
-constexpr char FW_VERSION[] = "2.1.120";
+constexpr char RADAR_DEVICE_NAME[] = "HLK-LD2451_2F42";
+constexpr char FW_VERSION[] = "2.1.121";
 constexpr uint32_t CPU_IDLE_MHZ = 80;
 constexpr uint32_t CPU_BOOST_MHZ = 160;
 constexpr uint32_t CPU_TOUCH_BOOST_MS = 1500;
@@ -185,7 +192,8 @@ static_assert(sizeof(LocationPacket) == 28, "Location packet v2 must be 28 bytes
 enum AppState { READY, MENU, OPTIONS_MENU, RIDES_LIST, ANCS_TEST, RIDE_MENU, STATUS_PAGE,
                 DISPLAY_PAGE, COUNTDOWN, RIDING, SUMMARY, CONFIRM_PAGE,
                 SAVE_RIDE_PROMPT, GPX_DEMO, ROUTES_LIST, START_ROUTE_MENU,
-                BLUETOOTH_PAGE, RIDE_CANCELED };
+                BLUETOOTH_PAGE, RADAR_SETUP, RADAR_SETTINGS, RADAR_PREVIEW,
+                RIDE_CANCELED };
 enum Gesture { GESTURE_NONE, GESTURE_TAP, GESTURE_LEFT, GESTURE_RIGHT,
                GESTURE_UP, GESTURE_POWER_OFF, GESTURE_ODOMETER_RESET,
                GESTURE_START_DEMO };
@@ -215,12 +223,14 @@ OtaUpdate otaUpdate;
 WifiConfig wifiConfig;
 DeviceIconStore deviceIcon;
 RiderNetwork riderNetwork;
+RadarClient radarClient;
 bool otaLinkFast = false;
 
 AppState appState = READY;
 AppState statusReturnState = MENU;
 AppState displayReturnState = RIDE_MENU;
 AppState confirmReturnState = MENU;
+AppState radarSettingsReturnState = OPTIONS_MENU;
 PendingAction pendingAction = ACTION_NONE;
 gpx::Simulation gpxSimulation;
 constexpr uint32_t PQ_LOOP_ROUTE_ID = 0x25acf895u;
@@ -248,6 +258,10 @@ uint32_t rideStartMs = 0;
 uint32_t ridePreviousMs = 0;
 uint32_t ridePausedAtMs = 0;
 bool ridePaused = false;
+bool rideAutoPaused = false;
+uint32_t autoPauseStationarySinceMs = 0;
+uint32_t autoResumeMovingSinceMs = 0;
+uint32_t autoResumeLastLocationMs = 0;
 uint32_t stationarySinceMs = 0;
 uint32_t zeroSpeedSinceMs = 0;
 uint32_t lastActivityMs = 0;
@@ -258,6 +272,16 @@ esp_reset_reason_t bootResetReason = ESP_RST_UNKNOWN;
 uint8_t normalBrightness = 196;
 bool displayAutoDimmed = false;
 float currentSpeedMph = 0.0f;
+float gpsSpeedTargetMph = 0.0f;
+float gpsSpeedCandidateMph = 0.0f;
+uint16_t gpsSpeedLastSequence = 0;
+uint8_t gpsSpeedCandidateCount = 0;
+bool gpsSpeedLocked = false;
+bool gpsSpeedHadFreshFix = false;
+uint32_t gpsSpeedCandidateStartMs = 0;
+uint32_t gpsSpeedLastSampleMs = 0;
+uint32_t gpsSpeedLastValidMs = 0;
+uint32_t gpsSpeedFilterMs = 0;
 float rideMaxSpeedMph = 0.0f;
 float distanceMiles = 0.0f;
 float averageSpeedMph = 0.0f;
@@ -275,6 +299,20 @@ float filteredBarometerRelativeFt = 0.0f;
 float filteredGpsRelativeFt = 0.0f;
 float gpsAltitudeDriftCorrectionFt = 0.0f;
 uint32_t lastAltitudePacketMs = 0;
+
+void resetGpsSpeedFilter(uint32_t now) {
+  currentSpeedMph = 0.0f;
+  gpsSpeedTargetMph = 0.0f;
+  gpsSpeedCandidateMph = 0.0f;
+  gpsSpeedLastSequence = 0;
+  gpsSpeedCandidateCount = 0;
+  gpsSpeedLocked = false;
+  gpsSpeedHadFreshFix = false;
+  gpsSpeedCandidateStartMs = 0;
+  gpsSpeedLastSampleMs = 0;
+  gpsSpeedLastValidMs = 0;
+  gpsSpeedFilterMs = now;
+}
 constexpr float GPS_ALTITUDE_CORRECTION_TAU_SECONDS = 120.0f;
 constexpr float BAROMETER_FILTER_TAU_SECONDS = 2.3f;
 constexpr float GPS_ALTITUDE_FILTER_TAU_SECONDS = 6.2f;
@@ -357,6 +395,9 @@ uint8_t batteryPercent = 0;
 uint32_t lastBatteryReadMs = 0;
 bool bluetoothEnabled=true;
 bool ridarEnabled=false;
+bool radarEnabled=false;
+RadarClient::Settings radarSettings;
+bool radarSettingsDirty=false;
 BLECharacteristic *statusCharacteristic = nullptr;
 BLECharacteristic *deviceNameCharacteristic = nullptr;
 String deviceNickname = BLE_DEVICE_NAME;
@@ -376,6 +417,7 @@ double odometerPendingMiles = 0.0;
 double tripAPendingMiles = 0.0;
 double tripBPendingMiles = 0.0;
 bool odometerStorageReady = false;
+bool odometerRecordInvalid = false;
 SavedRideMeta savedRides[MAX_SAVED_RIDES] = {};
 uint8_t savedRideCount = 0;
 bool rideStorageReady = false;
@@ -844,7 +886,8 @@ void notifyPhone(const char *status) {
 bool otaCanStart() {
   const bool rideActive = appState == COUNTDOWN || appState == RIDING ||
       appState == RIDE_MENU || appState == SUMMARY ||
-      appState == SAVE_RIDE_PROMPT;
+      appState == SAVE_RIDE_PROMPT ||
+      (appState == RADAR_SETTINGS && radarSettingsReturnState == RIDING);
   return !rideActive && (!batteryConnected || batteryCharging || batteryPercent >= 25);
 }
 
@@ -911,19 +954,29 @@ void loadOdometers() {
     return;
   }
   OdometerRecord record = {};
-  if (odometerPreferences.getBytesLength("counters") == sizeof(record) &&
+  const bool valid = odometerPreferences.getBytesLength("counters") == sizeof(record) &&
       odometerPreferences.getBytes("counters", &record, sizeof(record)) == sizeof(record) &&
       record.magic == ODOMETER_MAGIC && record.version == 1 &&
       isfinite(record.odometerMiles) && isfinite(record.tripAMiles) &&
-      isfinite(record.tripBMiles)) {
+      isfinite(record.tripBMiles);
+  odometerRecordInvalid = odometerPreferences.isKey("counters") && !valid;
+  if (valid) {
     odometerMiles = max(0.0, record.odometerMiles);
     tripAMiles = max(0.0, record.tripAMiles);
     tripBMiles = max(0.0, record.tripBMiles);
+  } else if (odometerRecordInvalid) {
+    Serial.println("Odometer NVS record invalid; preserving it for recovery");
   }
 }
 
 void saveOdometers(bool includePending = true) {
-  if (!odometerStorageReady) return;
+  if (!odometerStorageReady || odometerRecordInvalid) return;
+  if (!isfinite(odometerMiles) || !isfinite(tripAMiles) ||
+      !isfinite(tripBMiles) || !isfinite(odometerPendingMiles) ||
+      !isfinite(tripAPendingMiles) || !isfinite(tripBPendingMiles)) {
+    Serial.println("Odometer checkpoint skipped: nonfinite counter");
+    return;
+  }
   if (!odometerPreferences.isKey("counters") &&
       odometerMiles == 0.0 && tripAMiles == 0.0 && tripBMiles == 0.0 &&
       odometerPendingMiles == 0.0) {
@@ -1627,12 +1680,15 @@ void drawMushroom(int x, int y) {
   canvas->fillCircle(x + us(7), y + us(7), us(11), WHITE);
 }
 
+void drawRadarWarningRing(uint32_t now);
+
 void beginFrame() { canvas->fillScreen(BLACK); }
 void endFrame() {
   if (suppressFrameFlush) {
     suppressedFrameCompleted = true;
     return;
   }
+  drawRadarWarningRing(millis());
   // Preserve the original UI/touch timing, but avoid the expensive QSPI
   // transfer when rendering produced exactly the same pixels as last time.
   const uint32_t *pixels = reinterpret_cast<const uint32_t *>(canvas->getFramebuffer());
@@ -1651,6 +1707,7 @@ void endAnimatedFrame() {
     suppressedFrameCompleted = true;
     return;
   }
+  drawRadarWarningRing(millis());
   // Animation frames are known to differ. Avoid rereading the entire 434 KB
   // PSRAM framebuffer just to prove that before sending it to the display.
   canvas->flush();
@@ -1854,6 +1911,8 @@ void drawReadyScreen(uint32_t now) {
   endAnimatedFrame();
 }
 
+#include "menu_graphics.inc"
+
 void drawMenu(uint32_t now) {
   const bool ride = appState == RIDE_MENU;
   beginFrame();
@@ -1875,7 +1934,7 @@ void drawMenu(uint32_t now) {
     canvas->drawFastHLine(ux(48), uy(79), ux(144), 0x4208);
     textCentered("Info", ux(70), uy(101), 4, WHITE);
     textCentered("Display", ux(170), uy(101), 4, WHITE);
-    textCenteredScaled("i", ux(70), uy(143), 2, WHITE);
+    drawMenuInfoIcon(ux(70), uy(140), 0.58f);
     canvas->fillCircle(ux(170),uy(140),us(14),WHITE);
     for(int ray=0;ray<8;++ray) {
       const float angle=ray*PI/4;
@@ -1883,46 +1942,24 @@ void drawMenu(uint32_t now) {
                ux(170)+lroundf(cosf(angle)*us(26)),uy(140)+lroundf(sinf(angle)*us(26)),us(2),WHITE);
     }
 
-    // Broad filled controls sit against the round lower edge. Their large
-    // hit regions make the critical ride controls easy to use with gloves.
-    const uint16_t pauseTop = ridePaused ? GREEN : YELLOW;
-    const uint16_t pauseBottom = ridePaused
-        ? interpolateRgb565(GREEN, BLACK, 0.38f) : ORANGE;
-    fillVerticalGradientRoundRect(ux(18), uy(178), us(99), us(55), us(12),
-                                  pauseTop, pauseBottom);
-    fillVerticalGradientRoundRect(ux(123), uy(178), us(99), us(55), us(12),
-                                  interpolateRgb565(RED, WHITE, 0.20f),
-                                  interpolateRgb565(RED, BLACK, 0.32f));
+    canvas->drawFastHLine(ux(48), uy(174), us(144), 0x4208);
+    canvas->drawFastVLine(CENTER, uy(179), us(50), 0x4208);
     if (ridePaused) {
-      canvas->fillTriangle(ux(58), uy(191), ux(58), uy(221),
-                           ux(81), uy(206), WHITE);
+      for (int row = 0; row < us(36); ++row) {
+        const int half = us(18);
+        const int width = us(35) * (half - abs(row - half)) / half;
+        canvas->drawFastHLine(ux(55), uy(184) + row, max(1, width),
+            interpolateRgb565(GREEN, 0x0240, float(row) / us(35)));
+      }
     } else {
-      canvas->fillRoundRect(ux(56), uy(192), us(8), us(28), us(2), WHITE);
-      canvas->fillRoundRect(ux(72), uy(192), us(8), us(28), us(2), WHITE);
+      fillVerticalGradientRoundRect(ux(57), uy(184), us(9), us(36), us(4), YELLOW, ORANGE);
+      fillVerticalGradientRoundRect(ux(74), uy(184), us(9), us(36), us(4), YELLOW, ORANGE);
     }
-    canvas->fillRoundRect(ux(159), uy(193), us(27), us(27), us(3), WHITE);
+    fillVerticalGradientRoundRect(ux(156), uy(184), us(35), us(35), us(9), MENU_PINK, RED);
     endFrame();
     return;
   }
-  // Removing the old title leaves room for the RiDar control without making
-  // the shutdown slider any smaller. These centers are mirrored by activate().
-  textCentered("Status", ux(72), uy(50), 4, WHITE);
-  textCentered("Routes", ux(168), uy(50), 4, WHITE);
-  textCentered("Bluetooth", ux(72), uy(83), 4, WHITE);
-  textCentered("History", ux(168), uy(83), 4, WHITE);
-  textCentered("Display", ux(72), uy(116), 4, WHITE);
-  textCentered("Odometer", ux(168), uy(116), 4, WHITE);
-
-  textCentered("RiDar", ux(72), uy(151), 4, WHITE);
-  const int ridarLeft=ux(130),ridarTop=uy(134),ridarWidth=us(76),ridarHeight=us(34);
-  fillVerticalGradientRoundRect(ridarLeft,ridarTop,ridarWidth,ridarHeight,
-                                ridarHeight/2,
-                                ridarEnabled ? GREEN : 0x630C,
-                                ridarEnabled ? interpolateRgb565(GREEN,BLACK,0.42f) : 0x3186);
-  const int ridarKnobX=ridarEnabled ? ux(188) : ux(148);
-  canvas->fillCircle(ridarKnobX,uy(151),us(14),WHITE);
-  textCentered(ridarEnabled ? "ON" : "OFF",
-               ridarEnabled ? ux(151) : ux(183),uy(151),2,WHITE);
+  drawGraphicalMenuPage();
 
   // Deliberate slide-to-off control. A tap cannot accidentally shut down.
   const int sliderLeft = ux(71);
@@ -2114,14 +2151,20 @@ void drawStatus(uint32_t now) {
   } else {
     drawHeader(now);
     textCentered("DISTANCE", CENTER, uy(57), 4, WHITE);
-    snprintf(line, sizeof(line), "ODO  %.1f mi", odometerMiles + odometerPendingMiles);
+    if (!odometerRecordInvalid && isfinite(odometerMiles + odometerPendingMiles))
+      snprintf(line, sizeof(line), "ODO  %.1f mi", odometerMiles + odometerPendingMiles);
+    else snprintf(line, sizeof(line), "ODO  --");
     textCentered(line, CENTER, uy(85), 3, WHITE);
 
-    snprintf(line, sizeof(line), "TRIP A  %.1f mi", tripAMiles + tripAPendingMiles);
+    if (!odometerRecordInvalid && isfinite(tripAMiles + tripAPendingMiles))
+      snprintf(line, sizeof(line), "TRIP A  %.1f mi", tripAMiles + tripAPendingMiles);
+    else snprintf(line, sizeof(line), "TRIP A  --");
     canvas->drawRoundRect(ux(25), uy(103), us(190), us(31), us(7), 0x4208);
     textCentered(line, CENTER, uy(119), 3, WHITE);
 
-    snprintf(line, sizeof(line), "TRIP B  %.1f mi", tripBMiles + tripBPendingMiles);
+    if (!odometerRecordInvalid && isfinite(tripBMiles + tripBPendingMiles))
+      snprintf(line, sizeof(line), "TRIP B  %.1f mi", tripBMiles + tripBPendingMiles);
+    else snprintf(line, sizeof(line), "TRIP B  --");
     canvas->drawRoundRect(ux(25), uy(138), us(190), us(31), us(7), 0x4208);
     textCentered(line, CENTER, uy(154), 3, WHITE);
 
@@ -2221,6 +2264,141 @@ void drawBluetoothPage(uint32_t now) {
   textCentered("OFF",ux(45),uy(135),2,WHITE);
   textCentered("ON",ux(195),uy(135),2,WHITE);
   endFrame();
+}
+
+constexpr float RADAR_RANGE_FEET_PER_METER = 3.28084f;
+constexpr int RADAR_RANGE_STEP_FEET = 20;
+constexpr int RADAR_RANGE_MIN_FEET = 40;
+constexpr int RADAR_RANGE_MAX_FEET = 320;
+
+int radarRangeFeet(uint8_t meters) {
+  const int rounded = int(lroundf(
+      meters * RADAR_RANGE_FEET_PER_METER / RADAR_RANGE_STEP_FEET)) *
+      RADAR_RANGE_STEP_FEET;
+  return constrain(rounded, RADAR_RANGE_MIN_FEET, RADAR_RANGE_MAX_FEET);
+}
+
+uint8_t radarRangeMetersFromFeet(int feet) {
+  return uint8_t(constrain(
+      int(lroundf(feet / RADAR_RANGE_FEET_PER_METER)), 10, 100));
+}
+
+void drawRadarSetupPage(uint32_t now) {
+  const RadarClient::State state = radarClient.state();
+  beginFrame();
+  drawHeader(now);
+  textCentered("RADAR", CENTER, uy(64), 4, WHITE);
+  textCentered("LD2451 2F42", CENTER, uy(89), 2, 0xAD55);
+
+  if (state == RadarClient::STATE_SEARCHING) {
+    textCentered("Searching...", CENTER, uy(127), 3, YELLOW);
+    const float phase = (now % 1200) * 2.0f * PI / 1200.0f;
+    canvas->fillCircle(CENTER + lroundf(cosf(phase) * us(24)),
+                       uy(154) + lroundf(sinf(phase) * us(10)), us(3), YELLOW);
+  } else if (state == RadarClient::STATE_FOUND ||
+             state == RadarClient::STATE_CONNECTING) {
+    textCentered("Radar Found", CENTER, uy(119), 3, GREEN);
+    textCentered("Connecting...", CENTER, uy(148), 3, YELLOW);
+  } else if (state == RadarClient::STATE_CONNECTED) {
+    textCentered("Radar Connected", CENTER, uy(119), 3, GREEN);
+    if (radarClient.configState() == RadarClient::CONFIG_APPLYING) {
+      textCentered("Applying saved settings...", CENTER, uy(148), 2, YELLOW);
+    } else {
+      char profile[40];
+      const char *profileDirection = radarSettings.direction == 0 ? "APPROACH" :
+          (radarSettings.direction == 1 ? "AWAY" : "BOTH");
+      snprintf(profile, sizeof(profile), "%dft  %s  SNR %u",
+               radarRangeFeet(radarSettings.maximumRangeMeters), profileDirection,
+               radarSettings.snrThreshold);
+      textCentered(profile, CENTER, uy(148), 2, WHITE);
+      canvas->fillRoundRect(ux(76), uy(174), us(88), us(42), us(9), GREEN);
+      textCentered("OK", CENTER, uy(195), 4, BLACK);
+    }
+  } else if (state == RadarClient::STATE_TIMED_OUT) {
+    textCentered("Connection timed out", CENTER, uy(117), 3, RED);
+    textCentered("Check power and close", CENTER, uy(143), 2, WHITE);
+    textCentered("HLKRadarTool / Bluefy", CENTER, uy(161), 2, WHITE);
+    canvas->fillRoundRect(ux(66), uy(184), us(108), us(38), us(9), RED);
+    textCentered("OK", CENTER, uy(203), 3, WHITE);
+  } else {
+    textCentered("Radar Off", CENTER, uy(126), 3, 0xAD55);
+  }
+  endFrame();
+}
+
+void loadRadarSettings() {
+  if (!deviceStorageReady) return;
+  // Apply the safety-focused radar profile once when this firmware generation
+  // first boots. Later changes from the settings page remain persistent.
+  constexpr uint8_t RADAR_PROFILE_VERSION = 1;
+  if (devicePreferences.getUChar("rprofile", 0) < RADAR_PROFILE_VERSION) {
+    radarSettings = RadarClient::Settings{};
+    devicePreferences.putUChar("rrange", radarSettings.maximumRangeMeters);
+    devicePreferences.putUChar("rdir", radarSettings.direction);
+    devicePreferences.putUChar("rminspd", radarSettings.minimumSpeedKmh);
+    devicePreferences.putUChar("rhold", radarSettings.noTargetDelaySeconds);
+    devicePreferences.putUChar("rtrigger", radarSettings.triggerCount);
+    devicePreferences.putUChar("rsnr", radarSettings.snrThreshold);
+    devicePreferences.putUChar("rprofile", RADAR_PROFILE_VERSION);
+    return;
+  }
+  radarSettings.maximumRangeMeters = uint8_t(constrain(
+      int(devicePreferences.getUChar("rrange", 75)), 10, 100));
+  radarSettings.direction = uint8_t(constrain(
+      int(devicePreferences.getUChar("rdir", 0)), 0, 2));
+  radarSettings.minimumSpeedKmh = uint8_t(constrain(
+      int(devicePreferences.getUChar("rminspd", 15)), 0, 120));
+  radarSettings.noTargetDelaySeconds =
+      devicePreferences.getUChar("rhold", 1);
+  radarSettings.triggerCount = uint8_t(constrain(
+      int(devicePreferences.getUChar("rtrigger", 2)), 1, 10));
+  const uint8_t snr = devicePreferences.getUChar("rsnr", 32);
+  radarSettings.snrThreshold =
+      (snr == 0 || (snr >= 3 && snr <= 32)) ? snr : 32;
+}
+
+void saveRadarSettings() {
+  if (!deviceStorageReady) return;
+  devicePreferences.putUChar("rrange", radarSettings.maximumRangeMeters);
+  devicePreferences.putUChar("rdir", radarSettings.direction);
+  devicePreferences.putUChar("rminspd", radarSettings.minimumSpeedKmh);
+  devicePreferences.putUChar("rhold", radarSettings.noTargetDelaySeconds);
+  devicePreferences.putUChar("rtrigger", radarSettings.triggerCount);
+  devicePreferences.putUChar("rsnr", radarSettings.snrThreshold);
+}
+
+void adjustRadarSetting(uint8_t row, int delta) {
+  if (!delta) return;
+  if (row == 0) {
+    const int currentFeet = radarRangeFeet(radarSettings.maximumRangeMeters);
+    const int nextFeet = constrain(
+        currentFeet + delta * RADAR_RANGE_STEP_FEET,
+        RADAR_RANGE_MIN_FEET, RADAR_RANGE_MAX_FEET);
+    if (nextFeet != currentFeet)
+      radarSettings.maximumRangeMeters = radarRangeMetersFromFeet(nextFeet);
+  } else if (row == 1) {
+    radarSettings.direction = uint8_t(
+        (int(radarSettings.direction) + delta + 3) % 3);
+  } else if (row == 2) {
+    radarSettings.minimumSpeedKmh = uint8_t(constrain(
+        int(radarSettings.minimumSpeedKmh) + delta, 0, 120));
+  } else if (row == 3) {
+    radarSettings.noTargetDelaySeconds = uint8_t(constrain(
+        int(radarSettings.noTargetDelaySeconds) + delta, 0, 255));
+  } else if (row == 4) {
+    radarSettings.triggerCount = uint8_t(constrain(
+        int(radarSettings.triggerCount) + delta, 1, 10));
+  } else if (row == 5) {
+    if (radarSettings.snrThreshold == 0) {
+      if (delta > 0) radarSettings.snrThreshold = 3;
+    } else {
+      const int next = int(radarSettings.snrThreshold) + delta;
+      radarSettings.snrThreshold = next < 3
+          ? 0 : uint8_t(constrain(next, 3, 32));
+    }
+  }
+  radarClient.setSettings(radarSettings);
+  radarSettingsDirty = true;
 }
 
 void drawDisplayPage(uint32_t now) {
@@ -2332,20 +2510,138 @@ uint16_t speedArcColor(float position) {
   return blendRgb565(ORANGE, RED, (position - 0.74f) / 0.26f);
 }
 
-void drawGradeRing(uint32_t now) {
-  if (!liveGradeValid || liveGradePercent < 3.0f ||
-      now - lastGradeSampleMs > 5000) return;
-  // Single-pixel circle primitives are much cheaper than repeatedly filling
-  // large arc bands. Use a broad 36-pixel fade so the indication remains
-  // prominent while retaining a smooth transition into the black center.
-  constexpr int layers = 36;
+enum RadarWarningLevel : uint8_t {
+  RADAR_WARNING_NONE,
+  RADAR_WARNING_YELLOW,
+  RADAR_WARNING_ORANGE,
+  RADAR_WARNING_RED
+};
+
+RadarWarningLevel radarWarningLevel = RADAR_WARNING_NONE;
+uint8_t radarWarningCandidate = RADAR_WARNING_NONE;
+uint8_t radarWarningCandidateReports = 0;
+uint32_t radarWarningCandidateMs = 0;
+uint32_t radarWarningLastSeenMs[4] = {};
+uint32_t radarWarningLastRevision = 0;
+
+uint8_t radarTargetWarningLevel(const RadarClient::Target &target) {
+  if (!target.approaching || target.closingSpeedKmh <
+      int8_t(radarSettings.minimumSpeedKmh)) return RADAR_WARNING_NONE;
+  if (target.distanceMeters > radarSettings.maximumRangeMeters)
+    return RADAR_WARNING_NONE;
+  const float closingMph = target.closingSpeedKmh * 0.621371f;
+  const float distanceFeet = target.distanceMeters * 3.28084f;
+  const float closingFeetPerSecond = closingMph * 1.46667f;
+  const float ttc = closingFeetPerSecond > 0.2f
+      ? distanceFeet / closingFeetPerSecond : 999.0f;
+  if (ttc <= 5.0f || closingMph >= 20.0f) return RADAR_WARNING_RED;
+  if (ttc <= 10.0f || closingMph >= 10.0f) return RADAR_WARNING_ORANGE;
+  return RADAR_WARNING_YELLOW;
+}
+
+uint32_t radarWarningHoldMs(uint8_t level) {
+  if (level == RADAR_WARNING_RED) return 1250;
+  if (level == RADAR_WARNING_ORANGE) return 1500;
+  return 1750;
+}
+
+void updateRadarWarningState(uint32_t now) {
+  const RadarWarningLevel previous = radarWarningLevel;
+  const uint32_t revision = radarClient.targetRevision();
+  if (!radarEnabled || radarClient.state() != RadarClient::STATE_CONNECTED) {
+    radarWarningLevel = RADAR_WARNING_NONE;
+    radarWarningCandidate = RADAR_WARNING_NONE;
+    radarWarningCandidateReports = 0;
+    memset(radarWarningLastSeenMs, 0, sizeof(radarWarningLastSeenMs));
+    radarWarningLastRevision = revision;
+    if (previous != radarWarningLevel) previousDrawMs = 0;
+    return;
+  }
+
+  if (revision != radarWarningLastRevision) {
+    radarWarningLastRevision = revision;
+    uint8_t rawLevel = RADAR_WARNING_NONE;
+    // Moving-away targets remain available when BOTH/AWAY is selected, but
+    // only an approaching target can raise a rider warning.
+    if (radarSettings.direction != 1) {
+      RadarClient::Target targets[RadarClient::MAX_TARGETS] = {};
+      const size_t count = radarClient.snapshot(
+          targets, RadarClient::MAX_TARGETS, now);
+      for (size_t index = 0; index < count; ++index)
+        rawLevel = max(rawLevel, radarTargetWarningLevel(targets[index]));
+    }
+
+    if (rawLevel) {
+      for (uint8_t level = RADAR_WARNING_YELLOW; level <= rawLevel; ++level)
+        radarWarningLastSeenMs[level] = now;
+    }
+
+    if (rawLevel > radarWarningLevel) {
+      const bool consecutive = radarWarningCandidate == rawLevel &&
+          uint32_t(now - radarWarningCandidateMs) <= 500;
+      radarWarningCandidate = rawLevel;
+      radarWarningCandidateReports = consecutive
+          ? uint8_t(radarWarningCandidateReports + 1) : 1;
+      radarWarningCandidateMs = now;
+      if (radarWarningCandidateReports >= 2) {
+        radarWarningLevel = RadarWarningLevel(rawLevel);
+        radarWarningCandidate = RADAR_WARNING_NONE;
+        radarWarningCandidateReports = 0;
+      }
+    } else {
+      radarWarningCandidate = RADAR_WARNING_NONE;
+      radarWarningCandidateReports = 0;
+    }
+  } else if (radarWarningCandidateReports &&
+             uint32_t(now - radarWarningCandidateMs) > 500) {
+    radarWarningCandidate = RADAR_WARNING_NONE;
+    radarWarningCandidateReports = 0;
+  }
+
+  if (radarWarningLevel != RADAR_WARNING_NONE &&
+      uint32_t(now - radarWarningLastSeenMs[radarWarningLevel]) >=
+          radarWarningHoldMs(radarWarningLevel)) {
+    RadarWarningLevel retained = RADAR_WARNING_NONE;
+    for (int level = int(radarWarningLevel) - 1;
+         level >= int(RADAR_WARNING_YELLOW); --level) {
+      if (uint32_t(now - radarWarningLastSeenMs[level]) <
+          radarWarningHoldMs(uint8_t(level))) {
+        retained = RadarWarningLevel(level);
+        break;
+      }
+    }
+    radarWarningLevel = retained;
+  }
+
+  if (previous != radarWarningLevel) previousDrawMs = 0;
+}
+
+void drawRadarWarningRing(uint32_t now) {
+  if ((appState != RIDING && appState != RADAR_PREVIEW) ||
+      radarWarningLevel == RADAR_WARNING_NONE) return;
+
   constexpr int outerRadius = SCREEN_SIZE / 2 - 2;
-  const float phase = (now % 2400) * (2.0f * PI / 2400.0f);
-  const float breath = 0.42f + 0.58f * (0.5f + 0.5f * sinf(phase));
-  const uint16_t color = gradeColor(liveGradePercent);
+  int layers = 42;
+  float intensity = 1.0f;
+  uint16_t color = YELLOW;
+  if (radarWarningLevel == RADAR_WARNING_YELLOW) {
+    const float phase = (now % 2400) * (2.0f * PI / 2400.0f);
+    intensity = 0.35f + 0.65f * (0.5f + 0.5f * sinf(phase));
+  } else if (radarWarningLevel == RADAR_WARNING_ORANGE) {
+    layers = 50;
+    intensity = 0.92f;
+    color = ORANGE;
+  } else {
+    layers = 60;
+    // A 500 ms period is two complete flashes per second. Keep a faint ring
+    // during the off half-cycle so the warning never disappears completely.
+    intensity = (now % 500) < 250 ? 1.0f : 0.10f;
+    color = RED;
+  }
+
   for (int layer = 0; layer < layers; ++layer) {
     const float inwardFade = 1.0f - float(layer) / float(layers - 1);
-    const float strength = breath * inwardFade * inwardFade;
+    const float strength = intensity * inwardFade * inwardFade;
     canvas->drawCircle(CENTER, CENTER, outerRadius - layer,
                        scaleRgb565(color, strength));
   }
@@ -2376,14 +2672,34 @@ void drawRideStat(const char *value, const char *label, int x) {
   textCentered(label, x, uy(216), 2, 0x8410);
 }
 
-int visibleRidePageCount() { return ridarEnabled ? PAGE_COUNT : PAGE_COUNT - 1; }
+int visibleRidePages(int pages[MAX_RIDE_PAGE_COUNT]) {
+  int count=0;
+  pages[count++]=0;
+  pages[count++]=1;
+  pages[count++]=gpx::PAGE_INDEX;
+  if(radarEnabled)pages[count++]=RADAR_PAGE_INDEX;
+  return count;
+}
+
+int visibleRidePageCount() {
+  int pages[MAX_RIDE_PAGE_COUNT];
+  return visibleRidePages(pages);
+}
+
+int visibleRidePagePosition(int page) {
+  int pages[MAX_RIDE_PAGE_COUNT];
+  const int count=visibleRidePages(pages);
+  for(int i=0;i<count;++i)if(pages[i]==page)return i;
+  return 0;
+}
 
 void drawRidePageDots() {
-  const int pageCount = visibleRidePageCount();
+  int pages[MAX_RIDE_PAGE_COUNT];
+  const int pageCount=visibleRidePages(pages);
   for (int i = 0; i < pageCount; ++i)
     canvas->fillCircle(CENTER + us((2 * i - (pageCount - 1)) * 5),
                        uy(232), us(2.5f),
-                       currentPage == i ? GREEN : 0x4208);
+                       currentPage == pages[i] ? GREEN : 0x4208);
 }
 
 void drawLiveMetric(const char *value, const char *name, const char *unit,
@@ -2501,7 +2817,8 @@ void fillSpeedArcSegment(int centerX, int centerY, int innerRadius,
                        innerStartX, innerStartY, color);
 }
 
-void drawAnimatedSpeedArcPage(uint32_t now, uint32_t seconds) {
+void drawAnimatedSpeedArcPage(uint32_t now, uint32_t seconds,
+                              float routeProgress = -1.0f) {
   constexpr float maximumSpeed = 25.0f;
   constexpr float startDegrees = 160.0f;
   constexpr float sweepDegrees = 220.0f;
@@ -2509,9 +2826,13 @@ void drawAnimatedSpeedArcPage(uint32_t now, uint32_t seconds) {
   const int centerY = uy(137);
   const int innerRadius = us(78);
   const int outerRadius = us(93);
-  const float speedPosition = constrain(currentSpeedMph / maximumSpeed,
+  const float safeSpeedMph = isfinite(currentSpeedMph)
+      ? max(0.0f, currentSpeedMph) : 0.0f;
+  const float safeMaximumSpeedMph = isfinite(rideMaxSpeedMph)
+      ? max(0.0f, rideMaxSpeedMph) : 0.0f;
+  const float speedPosition = constrain(safeSpeedMph / maximumSpeed,
                                         0.0f, 1.0f);
-  const float maximumPosition = constrain(rideMaxSpeedMph / maximumSpeed,
+  const float maximumPosition = constrain(safeMaximumSpeedMph / maximumSpeed,
                                           0.0f, 1.0f);
 
   for (int i = 0; i < segments; ++i) {
@@ -2548,9 +2869,12 @@ void drawAnimatedSpeedArcPage(uint32_t now, uint32_t seconds) {
   char speedText[12];
   char distanceText[16];
   char timeText[16];
-  const float displaySpeed=max(0.0f,currentSpeedMph);
+  const float displaySpeed=safeSpeedMph;
+  const float displayDistance=isfinite(distanceMiles)
+      ? max(0.0f,distanceMiles) : 0.0f;
   snprintf(speedText, sizeof(speedText), "%d", int(roundf(displaySpeed)));
-  snprintf(distanceText, sizeof(distanceText), distanceMiles<9.995f ? "%.2f" : "%.1f", distanceMiles);
+  snprintf(distanceText, sizeof(distanceText),
+           displayDistance<9.995f ? "%.2f" : "%.1f", displayDistance);
   if(seconds<3600) {
     snprintf(timeText,sizeof(timeText),"%02lu:%02lu",
              (unsigned long)(seconds/60),(unsigned long)(seconds%60));
@@ -2571,7 +2895,49 @@ void drawAnimatedSpeedArcPage(uint32_t now, uint32_t seconds) {
   textCentered("0", ux(30), uy(173), 1, WHITE);
   textCentered("25", ux(210), uy(173), 1, WHITE);
 
-  canvas->drawFastHLine(ux(34), uy(181), ux(172), 0x4208);
+  const int horizonLeft = ux(34);
+  const int horizonRight = ux(206);
+  const int horizonY = uy(181);
+  if (routeProgress < 0.0f) {
+    // Preserve the original horizon during Free Ride.
+    canvas->drawFastHLine(horizonLeft, horizonY,
+                          horizonRight - horizonLeft, 0x4208);
+  } else {
+    // Reference colors sampled from the supplied artwork and quantized to the
+    // display's native RGB565 format.
+    constexpr uint16_t routeStartBlue = 0x1A6F;  // #1F4D7C
+    constexpr uint16_t routeCyan = 0x6F19;
+    constexpr uint16_t routeRemaining = 0xD6BA;  // #D5D5D5
+    const int railThickness = us(2);
+    const int railTop = horizonY - railThickness / 2;
+    const float progress = constrain(routeProgress, 0.0f, 1.0f);
+    const int markerX = horizonLeft +
+        lroundf((horizonRight - horizonLeft) * progress);
+
+    canvas->fillRect(horizonLeft, railTop,
+                     horizonRight - horizonLeft, railThickness,
+                     routeRemaining);
+    const int completedWidth = markerX - horizonLeft;
+    for (int x = horizonLeft; x <= markerX; ++x) {
+      const float amount = completedWidth > 0
+          ? float(x - horizonLeft) / completedWidth : 1.0f;
+      const uint16_t red = uint16_t((routeStartBlue >> 11) + lroundf(
+          (((routeCyan >> 11) & 0x1F) - (routeStartBlue >> 11)) * amount));
+      const uint16_t green = uint16_t(((routeStartBlue >> 5) & 0x3F) + lroundf(
+          (((routeCyan >> 5) & 0x3F) - ((routeStartBlue >> 5) & 0x3F)) * amount));
+      const uint16_t blue = uint16_t((routeStartBlue & 0x1F) + lroundf(
+          ((routeCyan & 0x1F) - (routeStartBlue & 0x1F)) * amount));
+      const uint16_t color = uint16_t((red << 11) | (green << 5) | blue);
+      canvas->drawFastVLine(x, railTop, railThickness, color);
+    }
+
+    // Solid left-pointing teardrop matching the reference slider marker.
+    const int markerRadius = us(6);
+    canvas->fillTriangle(markerX - us(10), horizonY,
+                         markerX, horizonY - markerRadius,
+                         markerX, horizonY + markerRadius, routeCyan);
+    canvas->fillCircle(markerX, horizonY, markerRadius, routeCyan);
+  }
   canvas->drawFastVLine(CENTER, uy(186), uy(39), 0x4208);
   textCentered("DIST", ux(72), uy(190), 1, 0x8410);
   textCentered(distanceText, ux(72), uy(210), 5, WHITE);
@@ -2581,20 +2947,29 @@ void drawAnimatedSpeedArcPage(uint32_t now, uint32_t seconds) {
 
 void drawPausedBadge() {
   if (!ridePaused) return;
-  canvas->fillRoundRect(ux(73), uy(49), us(94), us(23), us(6), BLACK);
-  canvas->drawRoundRect(ux(73), uy(49), us(94), us(23), us(6), YELLOW);
-  textCentered("PAUSED", CENTER, uy(61), 2, YELLOW);
+  const int left=rideAutoPaused ? ux(60) : ux(73);
+  const int width=rideAutoPaused ? us(120) : us(94);
+  canvas->fillRoundRect(left, uy(49), width, us(23), us(6), BLACK);
+  canvas->drawRoundRect(left, uy(49), width, us(23), us(6), YELLOW);
+  textCentered(rideAutoPaused ? "AUTO PAUSED" : "PAUSED",
+               CENTER, uy(61), rideAutoPaused ? 1 : 2, YELLOW);
 }
 
 #include "shared_map_display.inc"
 #include "gpx_display.inc"
 #include "pq_map_display.inc"
+#include "radar_display.inc"
 
 void drawRidePage(uint32_t now) {
+  if (!radarEnabled && currentPage == RADAR_PAGE_INDEX) currentPage = 0;
   if (!ridarEnabled && currentPage == RIDAR_PAGE_INDEX) currentPage = 0;
   if (currentPage == gpx::PAGE_INDEX) {
     if (routeNavigationEnabled) drawLiveGpxPage(now);
     else drawFreeRideMapPage(now);
+    return;
+  }
+  if (currentPage == RADAR_PAGE_INDEX) {
+    drawRadarPage(now);
     return;
   }
   if (currentPage == RIDAR_PAGE_INDEX) {
@@ -2603,10 +2978,13 @@ void drawRidePage(uint32_t now) {
   }
   const uint32_t seconds = activeRideElapsedMs(now) / 1000;
   beginFrame();
-  drawGradeRing(now);
   drawHeader(now);
   if (currentPage == 0) {
-    drawAnimatedSpeedArcPage(now, seconds);
+    const float routeProgress = routeNavigationEnabled
+        ? constrain(max(0.0f, gpxLastProgress) / max(1.0f, gpx::length()),
+                    0.0f, 1.0f)
+        : -1.0f;
+    drawAnimatedSpeedArcPage(now, seconds, routeProgress);
     if(routeNavigationEnabled && !gpxArrived &&
       gpxGuidance.mode()==gpx::OFF_COURSE) {
       if(!gpxOffCourseSinceMs) gpxOffCourseSinceMs=now;
@@ -2623,15 +3001,19 @@ void drawRidePage(uint32_t now) {
     // Three large, vertically spaced values fit inside the round display.
     char value[24];
     textCentered("DISTANCE", CENTER, uy(65), 2, 0xAD55);
-    snprintf(value, sizeof(value), distanceMiles<9.995f ? "%.2f MI" : "%.1f MI", distanceMiles);
+    if (isfinite(distanceMiles))
+      snprintf(value, sizeof(value), distanceMiles<9.995f ? "%.2f MI" : "%.1f MI", distanceMiles);
+    else snprintf(value, sizeof(value), "--");
     textCentered(value, CENTER, uy(87), 5, WHITE);
     canvas->drawFastHLine(ux(53), uy(106), us(134), 0x4208);
     textCentered("AVG SPEED", CENTER, uy(122), 2, 0xAD55);
-    snprintf(value, sizeof(value), "%.1f MPH", averageSpeedMph);
+    if (isfinite(averageSpeedMph)) snprintf(value, sizeof(value), "%.1f MPH", averageSpeedMph);
+    else snprintf(value, sizeof(value), "--");
     textCentered(value, CENTER, uy(144), 5, WHITE);
     canvas->drawFastHLine(ux(53), uy(163), us(134), 0x4208);
     textCentered("CLIMB", CENTER, uy(180), 2, 0xAD55);
-    snprintf(value, sizeof(value), "%.0f FT", climbFeet);
+    if (isfinite(climbFeet)) snprintf(value, sizeof(value), "%.0f FT", climbFeet);
+    else snprintf(value, sizeof(value), "--");
     textCentered(value, CENTER, uy(203), 5, WHITE);
   }
   drawRidePageDots();
@@ -2650,16 +3032,35 @@ uint32_t mapPrefetchFingerprint = 0;
 uint32_t mapPrefetchRevision = 0;
 bool mapPrefetchRouteMode = false;
 bool mapPrefetchValid = false;
+uint32_t lastRidePageChangeMs = 0;
+
+bool allocateMapPrefetchFrame() {
+  if (mapPrefetchFrame) return true;
+  mapPrefetchFrame = static_cast<uint16_t *>(ps_malloc(MAP_PREFETCH_BYTES));
+  return mapPrefetchFrame != nullptr;
+}
+
+void captureDisplayedMapFrame(uint32_t now) {
+  // The framebuffer already contains the complete map that is visible. Save
+  // it before changing pages instead of rerasterizing the same large vector
+  // map synchronously while the rider is waiting for the next page.
+  if (!allocateMapPrefetchFrame()) return;
+  memcpy(mapPrefetchFrame, canvas->getFramebuffer(), MAP_PREFETCH_BYTES);
+  mapPrefetchMs = now;
+  mapPrefetchFingerprint = sharedMap.fingerprint();
+  mapPrefetchRevision = sharedMap.revision();
+  mapPrefetchRouteMode = routeNavigationEnabled;
+  mapPrefetchValid = true;
+}
 
 void prepareMapFrame(uint32_t now) {
   if (appState != RIDING || currentPage == gpx::PAGE_INDEX ||
+      currentPage == RADAR_PAGE_INDEX || currentPage == RIDAR_PAGE_INDEX ||
       touchPending || touchActive || otaUpdate.active() || sharedMap.active() ||
-      gpxLibrary.active() || (mapPrefetchMs && now - mapPrefetchMs < 1000))
+      gpxLibrary.active() || now - lastRidePageChangeMs < 500 ||
+      (mapPrefetchMs && now - mapPrefetchMs < 1000))
     return;
-  if (!mapPrefetchFrame) {
-    mapPrefetchFrame = static_cast<uint16_t *>(ps_malloc(MAP_PREFETCH_BYTES));
-    if (!mapPrefetchFrame) return;
-  }
+  if (!allocateMapPrefetchFrame()) return;
 
   boostCpuForMapRender();
   suppressedFrameCompleted = false;
@@ -2686,6 +3087,7 @@ bool presentPreparedMapFrame(uint32_t now) {
     return false;
   boostCpuForMapRender();
   memcpy(canvas->getFramebuffer(), mapPrefetchFrame, MAP_PREFETCH_BYTES);
+  drawRadarWarningRing(now);
   canvas->flush();
   hasFramebufferHash = false;
   previousDrawMs = now;
@@ -2693,7 +3095,11 @@ bool presentPreparedMapFrame(uint32_t now) {
 }
 
 uint32_t rideFrameIntervalMs() {
+  if (radarWarningLevel == RADAR_WARNING_RED ||
+      radarWarningLevel == RADAR_WARNING_YELLOW) return 125;
   if (ridePaused) return 1000;
+  if (currentPage == RADAR_PAGE_INDEX)
+    return radarClient.state() == RadarClient::STATE_CONNECTED ? 100 : 500;
   if (currentPage == RIDAR_PAGE_INDEX)
     return ridarMapZoomAnimating ? 83 : 500;
   if (currentPage == gpx::PAGE_INDEX)
@@ -2899,7 +3305,9 @@ void openHome() {
 }
 void openOptionsMenu() {
   appState = OPTIONS_MENU;
-  menuSelection = 0;
+  // Return to the page that launched a submenu. openHome() resets this to
+  // the first page for a fresh visit from the home screen.
+  menuSelection = constrain(menuSelection, 0, 3);
   powerSliderActive = false;
   powerSliderX = ux(90);
   previousDrawMs = 0;
@@ -2946,8 +3354,12 @@ void finishRidePause(uint32_t now) {
   nextGpsSampleMs = now;
   ridePausedAtMs = 0;
   ridePaused = false;
+  rideAutoPaused = false;
+  autoPauseStationarySinceMs = 0;
+  autoResumeMovingSinceMs = 0;
+  autoResumeLastLocationMs = 0;
 
-  currentSpeedMph = 0.0f;
+  resetGpsSpeedFilter(now);
   stationarySinceMs = 0;
   zeroSpeedSinceMs = now;
   lastAltitudePacketMs = 0;
@@ -2958,18 +3370,28 @@ void finishRidePause(uint32_t now) {
   gradeMotionActive = false;
 }
 
+void beginRidePause(uint32_t now,bool automatic) {
+  if(ridePaused)return;
+  // Preserve the partial rolling minute up to the exact pause instant.
+  accumulateMinuteAverages(now);
+  ridePaused=true;
+  rideAutoPaused=automatic;
+  ridePausedAtMs=now;
+  ridePreviousMs=now;
+  resetGpsSpeedFilter(now);
+  liveGradeValid=false;
+  gradeMotionActive=false;
+  autoPauseStationarySinceMs=0;
+  autoResumeMovingSinceMs=0;
+  autoResumeLastLocationMs=0;
+  previousDrawMs=0;
+}
+
 void toggleRidePause(uint32_t now) {
   if (ridePaused) {
     finishRidePause(now);
   } else {
-    // Preserve the partial rolling minute up to the exact pause instant.
-    accumulateMinuteAverages(now);
-    ridePaused = true;
-    ridePausedAtMs = now;
-    ridePreviousMs = now;
-    currentSpeedMph = 0.0f;
-    liveGradeValid = false;
-    gradeMotionActive = false;
+    beginRidePause(now,false);
   }
   appState = RIDING;
   previousDrawMs = 0;
@@ -3123,8 +3545,10 @@ void startRide(uint32_t now) {
   gpxOffCourseStartRideMeters=-1;gpxOffCourseStartProgress=0;
   gpxOffCourseSinceMs=0;
   gpxGuidance.reset();gpxFixReceived=0;
-  appState = RIDING; currentPage = 0; currentSpeedMph = 0;
-  ridePaused = false; ridePausedAtMs = 0;
+  appState = RIDING; currentPage = 0; resetGpsSpeedFilter(now);
+  ridePaused = false; rideAutoPaused=false; ridePausedAtMs = 0;
+  autoPauseStationarySinceMs=autoResumeMovingSinceMs=0;
+  autoResumeLastLocationMs=0;
   rideMaxSpeedMph = 0; distanceMiles = 0; averageSpeedMph = 0;
   climbFeet = 0; filteredElevationFt = 0; climbAnchorFt = 0;
   altitudeFusionInitialized = false;
@@ -3297,7 +3721,8 @@ void completeRideEnd(bool saveRide) {
 bool rideSessionIsActive() {
   return appState == RIDING || appState == RIDE_MENU ||
       (appState == DISPLAY_PAGE && displayReturnState == RIDE_MENU) ||
-      (appState == STATUS_PAGE && statusReturnState == RIDE_MENU);
+      (appState == STATUS_PAGE && statusReturnState == RIDE_MENU) ||
+      (appState == RADAR_SETTINGS && radarSettingsReturnState == RIDING);
 }
 
 void preserveRideTailForShutdown(uint32_t now) {
@@ -3338,22 +3763,118 @@ void updateRideData(uint32_t now) {
     updateDemoRideData(now);
     return;
   }
-  if (ridePaused) {
-    ridePreviousMs = now;
-    currentSpeedMph = 0.0f;
-    liveGradeValid = false;
-    gradeMotionActive = false;
-    return;
-  }
-  const float deltaHours = (now - ridePreviousMs) / 3600000.0f;
-  ridePreviousMs = now;
   LocationPacket packet;
   bool available;
   uint32_t received;
   portENTER_CRITICAL(&locationMux);
   packet = latestLocation; available = hasLocation; received = lastLocationMs;
   portEXIT_CRITICAL(&locationMux);
-  const bool fresh = available && timestampIsFresh(now, received, LOCATION_TIMEOUT_MS);
+  const bool fresh = available &&
+      timestampIsFresh(now, received, LOCATION_TIMEOUT_MS);
+  // RMC speed is measured from GNSS Doppler and remains useful when the
+  // position HDOP is unavailable or temporarily poor.  Do not gate velocity
+  // on accuracyCm: doing so held the speedometer at zero on otherwise valid
+  // fixes and allowed the inactivity timer to put an active ride to sleep.
+  const bool speedSampleValid = fresh && (packet.flags & 1) &&
+      packet.speedCms <= 4470;  // 100 mph sanity ceiling.
+  float rawSpeedMph = speedSampleValid
+      ? packet.speedCms * 0.02236936f : 0.0f;
+  if(rawSpeedMph<0.7f)rawSpeedMph=0.0f;
+
+  if (ridePaused) {
+    // Manual pause remains manual. Only an automatically paused ride watches
+    // for sustained real movement and resumes itself.
+    if(rideAutoPaused && fresh && received!=autoResumeLastLocationMs) {
+      autoResumeLastLocationMs=received;
+      if(rawSpeedMph>=AUTO_RESUME_MIN_SPEED_MPH) {
+        if(!autoResumeMovingSinceMs)autoResumeMovingSinceMs=now;
+        if(now-autoResumeMovingSinceMs>=AUTO_RESUME_CONFIRM_MS) {
+          finishRidePause(now);
+          lastActivityMs=now;
+          previousDrawMs=0;
+        }
+      } else {
+        autoResumeMovingSinceMs=0;
+      }
+    } else if(!fresh) {
+      autoResumeMovingSinceMs=0;
+      autoResumeLastLocationMs=0;
+    }
+    if(ridePaused) {
+      ridePreviousMs = now;
+      currentSpeedMph = 0.0f;
+      liveGradeValid = false;
+      gradeMotionActive = false;
+      return;
+    }
+  }
+  const float deltaHours = (now - ridePreviousMs) / 3600000.0f;
+  ridePreviousMs = now;
+
+  // Update the GPS target once per receiver sample. The old fixed 0.35 filter
+  // ran on every main-loop pass, applying hundreds of corrections to the same
+  // packet and turning each 1 Hz GPS change into an immediate visible jump.
+  if (!fresh) {
+    if (gpsSpeedHadFreshFix) resetGpsSpeedFilter(now);
+  } else {
+    gpsSpeedHadFreshFix = true;
+    if (speedSampleValid && packet.sequence != gpsSpeedLastSequence) {
+      const uint32_t sampleIntervalMs = gpsSpeedLastSampleMs
+          ? max(uint32_t(100), received - gpsSpeedLastSampleMs) : 1000;
+      gpsSpeedLastSequence = packet.sequence;
+      gpsSpeedLastSampleMs = received;
+      gpsSpeedLastValidMs = now;
+
+      if (!gpsSpeedLocked) {
+        // Do not expose the first value produced while the receiver is still
+        // settling. Two nearby samples establish a real Doppler speed lock.
+        if (!gpsSpeedCandidateCount ||
+            fabsf(rawSpeedMph - gpsSpeedCandidateMph) > 3.0f) {
+          gpsSpeedCandidateMph = rawSpeedMph;
+          gpsSpeedCandidateCount = 1;
+          gpsSpeedCandidateStartMs = now;
+        } else {
+          gpsSpeedCandidateMph +=
+              (rawSpeedMph - gpsSpeedCandidateMph) /
+              float(gpsSpeedCandidateCount + 1);
+          ++gpsSpeedCandidateCount;
+          if (gpsSpeedCandidateCount >= 3 &&
+              now - gpsSpeedCandidateStartMs >= 800) {
+            gpsSpeedTargetMph = gpsSpeedCandidateMph < 0.7f
+                ? 0.0f : gpsSpeedCandidateMph;
+            gpsSpeedLocked = true;
+          }
+        }
+      } else {
+        // A bicycle cannot change speed arbitrarily between receiver fixes.
+        // Bound a single bad sample while still allowing brisk acceleration.
+        const float maximumChange = max(
+            1.5f, 6.0f * (sampleIntervalMs * 0.001f));
+        gpsSpeedTargetMph += constrain(rawSpeedMph - gpsSpeedTargetMph,
+                                       -maximumChange, maximumChange);
+        if (gpsSpeedTargetMph < 0.7f) gpsSpeedTargetMph = 0.0f;
+      }
+    } else if (gpsSpeedLastValidMs &&
+               now - gpsSpeedLastValidMs > 2500) {
+      gpsSpeedTargetMph = 0.0f;
+      gpsSpeedLocked = false;
+      gpsSpeedCandidateCount = 0;
+      gpsSpeedCandidateStartMs = 0;
+    }
+  }
+
+  if (!isfinite(gpsSpeedTargetMph) || !isfinite(currentSpeedMph))
+    resetGpsSpeedFilter(now);
+
+  const uint32_t speedFilterElapsedMs = gpsSpeedFilterMs
+      ? min(uint32_t(250), now - gpsSpeedFilterMs) : 0;
+  gpsSpeedFilterMs = now;
+  if (speedFilterElapsedMs) {
+    const float alpha = 1.0f - expf(-speedFilterElapsedMs / 550.0f);
+    currentSpeedMph += alpha * (gpsSpeedTargetMph - currentSpeedMph);
+  }
+  if (gpsSpeedTargetMph == 0.0f && currentSpeedMph < 0.1f)
+    currentSpeedMph = 0.0f;
   if (!rideStartEpoch && fresh && packet.timestamp > 0) {
     rideStartEpoch = packet.timestamp - activeRideElapsedMs(now) / 1000;
   }
@@ -3380,11 +3901,21 @@ void updateRideData(uint32_t now) {
     // One position per interval; do not duplicate a stale packet to catch up.
     nextGpsSampleMs = now + 10000;
   }
-  float target = fresh && (packet.flags & 1) ? packet.speedCms * 0.02236936f : 0;
-  if (target < 0.7f) target = 0;
-  if (target >= 1.0f) lastActivityMs = now;
-  currentSpeedMph += 0.35f * (target - currentSpeedMph);
-  if (!fresh && currentSpeedMph < 0.2f) currentSpeedMph = 0;
+  // Count motion from the current receiver sample.  The three-sample display
+  // lock and low-pass filter are presentation filters and must not delay the
+  // safety-critical inactivity timer.
+  if (speedSampleValid && rawSpeedMph >= 1.0f) lastActivityMs = now;
+  // Require three continuous minutes of fresh, stationary GPS samples. A
+  // missing fix never counts as stationary, and movement resets the timer.
+  if(fresh && rawSpeedMph<=AUTO_PAUSE_MAX_SPEED_MPH) {
+    if(!autoPauseStationarySinceMs)autoPauseStationarySinceMs=now;
+    if(now-autoPauseStationarySinceMs>=AUTO_PAUSE_STATIONARY_MS) {
+      beginRidePause(now,true);
+      return;
+    }
+  } else {
+    autoPauseStationarySinceMs=0;
+  }
   rideMaxSpeedMph = max(rideMaxSpeedMph, currentSpeedMph);
   // Use hysteresis so a rider hovering near 3 mph on a steep climb does not
   // make the grade alternate between a number and "--". Do not change this
@@ -3398,7 +3929,17 @@ void updateRideData(uint32_t now) {
     }
   }
   const double distanceIncrement = currentSpeedMph * deltaHours;
+  if (!isfinite(distanceIncrement) || distanceIncrement < 0.0 ||
+      distanceIncrement > 0.25) {
+    Serial.println("Ignored invalid ride-distance increment");
+    resetGpsSpeedFilter(now);
+    return;
+  }
+  if (!isfinite(distanceMiles)) distanceMiles = 0.0f;
   distanceMiles += distanceIncrement;
+  if (!isfinite(odometerPendingMiles)) odometerPendingMiles = 0.0;
+  if (!isfinite(tripAPendingMiles)) tripAPendingMiles = 0.0;
+  if (!isfinite(tripBPendingMiles)) tripBPendingMiles = 0.0;
   odometerPendingMiles += distanceIncrement;
   tripAPendingMiles += distanceIncrement;
   tripBPendingMiles += distanceIncrement;
@@ -3711,12 +4252,24 @@ Gesture pollTouch(uint32_t now) {
   // gesture starts in the lower 45 percent.
   if (dy <= -SWIPE_THRESHOLD && abs(dx) <= SWIPE_VERTICAL_LIMIT)
     return GESTURE_UP;
-  const int horizontalThreshold = appState == ANCS_TEST ? 24 : SWIPE_THRESHOLD;
+  const int horizontalThreshold = (appState == ANCS_TEST ||
+                                   appState == OPTIONS_MENU) ? 24 : SWIPE_THRESHOLD;
   if (abs(dx) >= horizontalThreshold && abs(dy) <= SWIPE_VERTICAL_LIMIT)
     return dx < 0 ? GESTURE_LEFT : GESTURE_RIGHT;
   if (abs(dx) < 30 && abs(dy) < 30 && now - touchStartMs < LONG_PRESS_MS) {
     lastTapX = touchLastX;
     lastTapY = touchLastY;
+    // Reserve the outer contour for paging. Icon taps remain in the middle
+    // of each half, so navigating never opens a menu item accidentally.
+    if (appState == OPTIONS_MENU && lastTapY >= uy(43) &&
+        lastTapY <= uy(181)) {
+      if (lastTapX <= ux(40)) return GESTURE_RIGHT;
+      if (lastTapX >= ux(200)) return GESTURE_LEFT;
+      if (lastTapY >= uy(157) && lastTapX < ux(90))
+        return GESTURE_RIGHT;
+      if (lastTapY >= uy(157) && lastTapX > ux(150))
+        return GESTURE_LEFT;
+    }
     // An automatic GPX preview used to claim every tap before the side-page
     // zones were checked. That made left/right taps dismiss first and change
     // pages only on a second touch. Preserve center-tap dismissal, but let a
@@ -4170,6 +4723,7 @@ void servicePhysicalPowerButton(uint32_t now) {
   if (physicalPowerButtonDown && rideAutoSavedForPowerButton) {
     routeNavigationEnabled = false;
     ridePaused = false;
+    rideAutoPaused = false;
     currentSpeedMph = 0.0f;
     openHome();
     notifyPhone("ready");
@@ -4223,6 +4777,7 @@ void shutDownAfterTimerBoot() {
 void enterDeepSleep(bool manualShutdown = false) {
   wifiConfig.stop();
   riderNetwork.pause();
+  radarClient.stopForSleep();
   if (manualShutdown && rideSessionIsActive() &&
       distanceMiles > AUTO_SAVE_RIDE_MIN_MILES) {
     const uint32_t shutdownMs = millis();
@@ -4268,6 +4823,7 @@ void enterLowPowerSleep(bool manualShutdown = false) {
 void enterInactiveSleep() {
   wifiConfig.stop();
   riderNetwork.pause();
+  radarClient.stopForSleep();
   // During an active ride, retain RAM and the open GPS log so the same ride
   // can continue after touch wake. NimBLE must be stopped before manual light
   // sleep; otherwise ESP-IDF may reject sleep and return immediately.
@@ -4331,6 +4887,9 @@ void enterInactiveSleep() {
   // The phone can reconnect while the retained ride resumes from the same
   // distance, timer, samples, and active GPS file.
   setupBluetooth();
+  radarClient.begin(RADAR_DEVICE_NAME);
+  radarClient.setSettings(radarSettings);
+  radarClient.setEnabled(radarEnabled,millis());
 
   if (pmicAvailable) {
     power.enableBattDetection();
@@ -4360,7 +4919,8 @@ void enterInactiveSleep() {
     demoRideActive = false;
     routeNavigationEnabled = false;
     ridePaused = false;
-    currentSpeedMph = 0.0f;
+    rideAutoPaused = false;
+    resetGpsSpeedFilter(wakeMs);
     openHome();
     lastActivityMs = wakeMs;
     zeroSpeedSinceMs = wakeMs;
@@ -4375,7 +4935,7 @@ void enterInactiveSleep() {
   minuteAccumulatorMs = wakeMs;
   nextAltitudeSampleMs = wakeMs + 60000;
   nextGpsSampleMs = wakeMs;
-  currentSpeedMph = 0.0f;
+  resetGpsSpeedFilter(wakeMs);
   barometerInitialized = false;
   gpsAltitudeInitialized = false;
   lastAltitudePacketMs = 0;
@@ -4398,8 +4958,15 @@ void moveSelection(int direction, uint32_t now) {
   // page look as though it was skipped.
   ignoreTouchUntilMs = now + PAGE_TOUCH_LOCKOUT_MS;
   if (appState == RIDING) {
-    const int pageCount = visibleRidePageCount();
-    currentPage = (currentPage + direction + pageCount) % pageCount;
+    int pages[MAX_RIDE_PAGE_COUNT];
+    const int pageCount=visibleRidePages(pages);
+    const int position=visibleRidePagePosition(currentPage);
+    const int previousPage=currentPage;
+    const int nextPage=pages[(position+direction+pageCount)%pageCount];
+    if(previousPage==gpx::PAGE_INDEX && nextPage!=gpx::PAGE_INDEX)
+      captureDisplayedMapFrame(now);
+    currentPage=nextPage;
+    lastRidePageChangeMs=now;
     if (currentPage == gpx::PAGE_INDEX) presentPreparedMapFrame(now);
   }
   else if (appState == SUMMARY) summaryPage = (summaryPage + direction + 4) % 4;
@@ -4408,7 +4975,7 @@ void moveSelection(int direction, uint32_t now) {
     ancsHistoryPage = constrain(next, 0, int(ancsHistoryCount));
   }
   else if (appState == MENU || appState == OPTIONS_MENU || appState == RIDE_MENU) {
-    const int count = appState == MENU ? 1 : (appState == OPTIONS_MENU ? 6 : 2);
+    const int count = appState == MENU ? 1 : (appState == OPTIONS_MENU ? 4 : 2);
     menuSelection = (menuSelection + direction + count) % count;
   } else if (appState == DISPLAY_PAGE) {
     int next = int(normalBrightness) + direction * 16;
@@ -4508,30 +5075,51 @@ void activate(uint32_t now) {
     else if (onMenu) openOptionsMenu();
     else { appState = READY; previousDrawMs = 0; }
   } else if (appState == OPTIONS_MENU) {
-    const bool onRidar = lastTapX >= ux(45) && lastTapX <= ux(215) &&
-                         lastTapY >= uy(130) && lastTapY <= uy(172);
-    if (onRidar) {
-      ridarEnabled = !ridarEnabled;
-      riderNetwork.setEnabled(ridarEnabled);
-      if (deviceStorageReady) devicePreferences.putBool("ridar_on",ridarEnabled);
+    const bool inIcons = lastTapY >= uy(42) && lastTapY <= uy(156);
+    const bool left = inIcons && lastTapX >= ux(18) && lastTapX <= ux(117);
+    const bool right = inIcons && lastTapX >= ux(123) && lastTapX <= ux(222);
+    const bool onRadarLabel = menuSelection == 3 && left;
+    if (onRadarLabel && radarClient.state() == RadarClient::STATE_CONNECTED) {
+      radarSettings = radarClient.settings();
+      radarSettingsDirty = false;
+      radarSettingsReturnState = OPTIONS_MENU;
+      appState = RADAR_SETTINGS;
+      previousDrawMs = 0;
+      return;
+    }
+    if (onRadarLabel) {
+      if (!bluetoothEnabled) {
+        bluetoothEnabled = true;
+        notifications.setEnabled(true);
+        if (deviceStorageReady) devicePreferences.putBool("ble_on", true);
+      }
+      // Discovery is provisional. Enable/persist the ride page only after
+      // connection succeeds, and reset a previous failed attempt first.
+      radarEnabled = false;
+      radarClient.setEnabled(false, now);
+      radarClient.setEnabled(true, now);
+      appState = RADAR_SETUP;
       previousDrawMs = 0;
       return;
     }
     int hit = -1;
-    const bool left = lastTapX >= ux(17) && lastTapX <= ux(117);
-    const bool right = lastTapX >= ux(123) && lastTapX <= ux(223);
-    int row = -1;
-    if (lastTapY >= uy(34) && lastTapY <= uy(66)) row = 0;
-    else if (lastTapY >= uy(67) && lastTapY <= uy(99)) row = 1;
-    else if (lastTapY >= uy(100) && lastTapY <= uy(128)) row = 2;
-    if (row >= 0 && (left || right)) hit = row * 2 + (right ? 1 : 0);
+    // Existing action IDs: Info, Routes, Bluetooth, History, Display, ODO.
+    static const int actions[3][2] = {{0,2},{1,3},{4,5}};
+    if(menuSelection < 3 && (left || right))
+      hit = actions[menuSelection][right ? 1 : 0];
+    // Dots are also direct page targets; icon taps open their named action.
+    if(lastTapY >= uy(160) && lastTapY <= uy(180) &&
+       lastTapX >= ux(90) && lastTapX <= ux(150)) {
+      menuSelection=constrain((lastTapX-ux(92))/us(14),0,3);
+      previousDrawMs=0;
+      return;
+    }
     // Touching the slider without dragging it far enough leaves this menu in
     // place. Black space beside it retains the universal Home action.
     const bool onPowerSlider = lastTapX >= ux(63) && lastTapX <= ux(177) &&
                                lastTapY >= uy(176) && lastTapY <= uy(232);
     if (onPowerSlider) return;
     if (hit < 0) { openHome(); return; }
-    menuSelection = hit;
     if (hit == 0) {
       statusReturnState = OPTIONS_MENU;
       statusPage = 0;
@@ -4722,10 +5310,16 @@ void setup() {
   gpxLibrary.restore(rideStorageReady,FW_VERSION);
   loadOdometers();
   loadDeviceNickname();
+  loadRadarSettings();
   if(deviceStorageReady)bluetoothEnabled=devicePreferences.getBool("ble_on",true);
-  if(deviceStorageReady)ridarEnabled=devicePreferences.getBool("ridar_on",false);
-  riderNetwork.setEnabled(ridarEnabled);
+  if(deviceStorageReady)radarEnabled=devicePreferences.getBool("radar_on",false);
+  if(radarEnabled)bluetoothEnabled=true;
+  ridarEnabled=false;
+  riderNetwork.setEnabled(false);
   setupBluetooth();
+  radarClient.setSettings(radarSettings);
+  radarClient.begin(RADAR_DEVICE_NAME);
+  radarClient.setEnabled(radarEnabled,millis());
   // Initialization ran behind the completed logo. Exit only after everything
   // needed by the home screen is ready, so there is no blank interstitial.
   finishPedalOneStartupSplash(splashLogoReadyMs);
@@ -4742,19 +5336,34 @@ void loop() {
   updateDynamicCpuClock(now);
   servicePhysicalPowerButton(now);
   now = millis();
-  wifiConfig.loop(otaCanStart() && !otaUpdate.active() && !otaUpdate.rebootPending(), phoneConnected);
-  if(bluetoothEnabled) { notifications.loop(); otaUpdate.loop(phoneConnected); }
+  // Read touch before radio, storage, radar, map, or GPS housekeeping. These
+  // services are cooperative and some perform blocking work; once a contact
+  // is pending, held, or completed, defer them for this loop so UI input wins.
+  const bool otaOwnsUi=otaUpdate.active() || otaUpdate.rebootPending();
+  const Gesture gesture=otaOwnsUi ? GESTURE_NONE : pollTouch(now);
+  const auto touchHasPriority=[&]() {
+    return touchPending || touchActive || gesture!=GESTURE_NONE;
+  };
+  if(!touchHasPriority())
+    wifiConfig.loop(otaCanStart() && !otaUpdate.active() &&
+                    !otaUpdate.rebootPending(),phoneConnected);
+  if(bluetoothEnabled && !touchHasPriority()) {
+    notifications.loop();
+    otaUpdate.loop(phoneConnected);
+  }
+  if(!touchHasPriority()) radarClient.service(now);
+  updateRadarWarningState(now);
   const bool bulkTransferActive = otaUpdate.active() || sharedMap.active() ||
       gpxLibrary.active();
   if (bulkTransferActive != otaLinkFast) {
     otaLinkFast = bulkTransferActive;
     notifications.setOtaMode(otaLinkFast);
   }
-  updateBattery(now);
+  if(!touchHasPriority()) updateBattery(now);
   const bool routeCanChange = (appState==READY || appState==MENU || appState==OPTIONS_MENU ||
       appState==GPX_DEMO || appState==ROUTES_LIST || appState==START_ROUTE_MENU) && !otaUpdate.active() && !otaUpdate.rebootPending();
-  if(bluetoothEnabled) gpxLibrary.loop(routeCanChange);
-  if(bluetoothEnabled) sharedMap.loop(routeCanChange);
+  if(bluetoothEnabled && !touchHasPriority()) gpxLibrary.loop(routeCanChange);
+  if(bluetoothEnabled && !touchHasPriority()) sharedMap.loop(routeCanChange);
   // Map packages, GPX files, and previews can cross the inactivity limit.
   // Treat every queued or active transfer packet as user activity so neither
   // sleep tier can interrupt the file while the phone is sending it.
@@ -4781,7 +5390,7 @@ void loop() {
       ridarLocation.longitudeE7>=-1800000000 && ridarLocation.longitudeE7<=1800000000;
   riderNetwork.setEnabled(ridarEnabled);
   const bool ridarIconAvailable=deviceIcon.availableFor(deviceEmoji);
-  const bool ridersChanged=riderNetwork.service(
+  const bool ridersChanged=!touchHasPriority() && riderNetwork.service(
       wifiConfig.busy() || otaUpdate.active() || otaUpdate.rebootPending(),
       ridarLocationValid,ridarLocation.latitudeE7,ridarLocation.longitudeE7,
       deviceNickname,
@@ -4800,19 +5409,29 @@ void loop() {
     delay(5);
     return;
   }
-  const Gesture gesture = pollTouch(now);
   // Keep acquisition running on route selection and playback screens too:
   // those modal screens return before the normal ride drawing path.
-  if (onboardGpsPresent) {
+  if (onboardGpsPresent && !touchHasPriority()) {
     onboardGps.service(millis());
     publishOnboardGpsFix(millis());
   }
   now=millis(); // GPS reads may have published a fix after this loop began.
+  if (gesture == GESTURE_TAP && appState == RIDING &&
+      currentPage == RADAR_PAGE_INDEX &&
+      lastTapY >= SCREEN_SIZE * 80 / 100) {
+    radarSettings = radarClient.settings();
+    radarSettingsDirty = false;
+    radarSettingsReturnState = RIDING;
+    appState = RADAR_SETTINGS;
+    previousDrawMs = 0;
+    return;
+  }
   if (gesture == GESTURE_TAP && lastTapY >= SCREEN_SIZE * 80 / 100) {
     const bool menuAlreadyOpen = appState == MENU ||
         appState == OPTIONS_MENU || appState == RIDE_MENU;
     const bool modalScreen = appState == CONFIRM_PAGE ||
-        appState == SAVE_RIDE_PROMPT || appState == RIDE_CANCELED;
+        appState == SAVE_RIDE_PROMPT || appState == RADAR_PREVIEW ||
+        appState == RIDE_CANCELED || appState == RADAR_SETUP;
     const bool odometerResetButton = appState == STATUS_PAGE && statusPage == 1 &&
         lastTapX >= ux(60) && lastTapX <= ux(180) &&
         lastTapY >= uy(178) && lastTapY <= uy(232);
@@ -4828,8 +5447,15 @@ void loop() {
     const bool ancsExitButton = appState == ANCS_TEST &&
         lastTapX >= ux(65) && lastTapX <= ux(175) &&
         lastTapY >= uy(194) && lastTapY <= uy(239);
+    const bool radarSetupButton = appState == RADAR_SETUP &&
+        lastTapX >= ux(55) && lastTapX <= ux(185) &&
+        lastTapY >= uy(168) && lastTapY <= uy(230);
+    const bool radarSettingsApply = appState == RADAR_SETTINGS &&
+        lastTapX >= ux(55) && lastTapX <= ux(185) &&
+        lastTapY >= uy(184) && lastTapY <= uy(235);
     const bool reservedControl = odometerResetButton || rideListEditButton ||
-        routeStartButton || summaryDoneButton || ancsExitButton;
+        routeStartButton || summaryDoneButton || ancsExitButton ||
+        radarSetupButton || radarSettingsApply;
     if (!menuAlreadyOpen && !modalScreen && !reservedControl) {
       const bool rideContext = appState == RIDING ||
           (appState == DISPLAY_PAGE && displayReturnState == RIDE_MENU) ||
@@ -4859,7 +5485,12 @@ void loop() {
         bluetoothEnabled=enabled;
         if(deviceStorageReady)devicePreferences.putBool("ble_on",enabled);
         notifications.setEnabled(enabled);
-        if(!enabled)phoneConnected=false;
+        if(!enabled) {
+          phoneConnected=false;
+          radarEnabled=false;
+          radarClient.setEnabled(false,now);
+          if(deviceStorageReady)devicePreferences.putBool("radar_on",false);
+        }
       }
       previousDrawMs=0;
     }
@@ -4867,6 +5498,119 @@ void loop() {
       previousDrawMs=now;drawBluetoothPage(now);
     }
     if(lastActivityMs && now-lastActivityMs>=AUTO_POWER_OFF_MS)enterLowPowerSleep();
+    delay(5);return;
+  }
+  if(appState==RADAR_SETUP) {
+    const RadarClient::State state=radarClient.state();
+    const bool swipeBack=gesture==GESTURE_UP || gesture==GESTURE_LEFT ||
+                         gesture==GESTURE_RIGHT;
+    const bool inButton=lastTapX>=ux(55) && lastTapX<=ux(185) &&
+                        lastTapY>=uy(168) && lastTapY<=uy(230);
+    const bool timedOutOK=gesture==GESTURE_TAP && inButton &&
+                          state==RadarClient::STATE_TIMED_OUT;
+    if(swipeBack || timedOutOK) {
+      radarEnabled=state==RadarClient::STATE_CONNECTED;
+      if(!radarEnabled)radarClient.setEnabled(false,now);
+      if(deviceStorageReady)devicePreferences.putBool("radar_on",radarEnabled);
+      ignoreTouchUntilMs=now+MENU_TOUCH_LOCKOUT_MS;
+      openOptionsMenu();menuSelection=3;return;
+    }
+    if(state==RadarClient::STATE_CONNECTED &&
+       radarClient.configState()!=RadarClient::CONFIG_APPLYING) {
+      radarEnabled=true;
+      if(deviceStorageReady)devicePreferences.putBool("radar_on",true);
+      ignoreTouchUntilMs=now+MENU_TOUCH_LOCKOUT_MS;
+      openOptionsMenu();menuSelection=3;return;
+    }
+    if(!previousDrawMs || now-previousDrawMs>=100) {
+      previousDrawMs=now;drawRadarSetupPage(now);
+    }
+    if(lastActivityMs && now-lastActivityMs>=AUTO_POWER_OFF_MS)enterLowPowerSleep();
+    delay(5);return;
+  }
+  if(appState==RADAR_SETTINGS) {
+    const bool settingsDuringRide = radarSettingsReturnState == RIDING;
+    if(settingsDuringRide) {
+      updateRideData(now);
+      updateAutoBrightness(now);
+      if(routeNavigationEnabled)updateGpxPosition(now);
+    }
+    const bool liveTestTap = gesture == GESTURE_TAP &&
+        lastTapX > ux(RADAR_SETTINGS_CONTROL_RIGHT) &&
+        lastTapY < uy(184);
+    if(liveTestTap && !settingsDuringRide && radarEnabled) {
+      appState=RADAR_PREVIEW;
+      previousDrawMs=0;
+      return;
+    }
+    if(gesture==GESTURE_UP) {
+      if(settingsDuringRide) {
+        appState=RIDING;
+        if(!radarEnabled && currentPage==RADAR_PAGE_INDEX)currentPage=0;
+        previousDrawMs=0;
+      } else {
+        openOptionsMenu();
+      }
+      return;
+    }
+    if(gesture==GESTURE_TAP) {
+      const bool onApply=lastTapX>=ux(55) && lastTapX<=ux(185) &&
+                         lastTapY>=uy(184) && lastTapY<=uy(235);
+      if(onApply) {
+        saveRadarSettings();
+        radarClient.setSettings(radarSettings);
+        radarClient.applySettings(radarSettings,now);
+        radarSettingsDirty=false;
+        previousDrawMs=0;
+      } else {
+        const bool steadyTap=abs(touchLastX-touchStartX)<=us(8) &&
+                             abs(touchLastY-touchStartY)<=us(8);
+        const bool insideControls=
+            lastTapX>=ux(RADAR_SETTINGS_CONTROL_LEFT) &&
+            lastTapX<=ux(RADAR_SETTINGS_CONTROL_RIGHT);
+        if(steadyTap && insideControls) {
+          for(uint8_t row=0;row<6;++row) {
+            const int centerY=uy(79+row*19);
+            if(abs(lastTapY-centerY)<=us(9)) {
+              adjustRadarSetting(row,lastTapX<CENTER ? -1 : 1);
+              previousDrawMs=0;
+              break;
+            }
+          }
+        }
+      }
+    }
+    if(!previousDrawMs || now-previousDrawMs>=200) {
+      previousDrawMs=now;drawRadarSettingsPage(now);
+    }
+    if(lastActivityMs && now-lastActivityMs>=AUTO_POWER_OFF_MS) {
+      if(settingsDuringRide)enterInactiveSleep();
+      else enterLowPowerSleep();
+    }
+    delay(5);return;
+  }
+  if(appState==RADAR_PREVIEW) {
+    if(!radarEnabled) {openOptionsMenu();return;}
+    const bool bottomTap=gesture==GESTURE_TAP &&
+        lastTapY>=SCREEN_SIZE*80/100;
+    const bool settingsTap=gesture==GESTURE_TAP &&
+        lastTapX<ux(RADAR_SETTINGS_CONTROL_LEFT) &&
+        lastTapY<SCREEN_SIZE*80/100;
+    if(gesture==GESTURE_UP || settingsTap || bottomTap) {
+      radarSettings=radarClient.settings();
+      radarSettingsDirty=false;
+      radarSettingsReturnState=OPTIONS_MENU;
+      appState=RADAR_SETTINGS;
+      previousDrawMs=0;
+      return;
+    }
+    const uint32_t refreshMs=radarClient.state()==RadarClient::STATE_CONNECTED
+        ? 100 : 500;
+    if(!previousDrawMs || now-previousDrawMs>=refreshMs) {
+      previousDrawMs=now;drawRadarPage(now);
+    }
+    if(lastActivityMs && now-lastActivityMs>=AUTO_POWER_OFF_MS)
+      enterLowPowerSleep();
     delay(5);return;
   }
   if(appState==START_ROUTE_MENU) {
@@ -4952,7 +5696,7 @@ void loop() {
   const bool navigationActive = !(routeNavigationEnabled && (appState==RIDING || appState==RIDE_MENU)) &&
       appState != ANCS_TEST &&
       appState != SAVE_RIDE_PROMPT && appState != CONFIRM_PAGE &&
-      appState != RIDE_CANCELED &&
+      appState != RIDE_CANCELED && appState != OPTIONS_MENU &&
       navigationIsVisible(now);
 
   if (appState == CONFIRM_PAGE && pendingAction == ACTION_RESET_ODOMETER &&
@@ -5108,18 +5852,23 @@ void loop() {
   // Static screens redraw once per second for the clock. Touch/state changes
   // set previousDrawMs to zero and therefore still redraw immediately.
   uint32_t interval = 1000;
-  if (appState == READY) interval = 50;
+  // Ten frames per second keeps the rolling logo gradient visibly animated
+  // while halving the expensive full-frame AMOLED transfers.
+  if (appState == READY) interval = 100;
   else if (appState == COUNTDOWN) interval = 33;
   else if (navigationActive) interval = 1000;
   else if (appState == RIDING) interval = rideFrameIntervalMs();
   const bool deferLiveMapForTouch = appState == RIDING &&
-      (currentPage == gpx::PAGE_INDEX || currentPage == RIDAR_PAGE_INDEX) &&
+      (currentPage == gpx::PAGE_INDEX ||
+       currentPage == RIDAR_PAGE_INDEX) &&
       touchActive;
-  if (!deferLiveMapForTouch &&
+  const bool deferReadyAnimationForTouch=appState==READY && touchHasPriority();
+  if (!deferLiveMapForTouch && !deferReadyAnimationForTouch &&
       (!previousDrawMs || now - previousDrawMs >= interval)) {
     previousDrawMs = now;
     const bool drawingLiveMap = appState == RIDING &&
-        (currentPage == gpx::PAGE_INDEX || currentPage == RIDAR_PAGE_INDEX);
+        (currentPage == gpx::PAGE_INDEX ||
+         currentPage == RIDAR_PAGE_INDEX);
     if (drawingLiveMap) boostCpuForMapRender();
     if (navigationActive) drawNavigationPage(now);
     else if (appState == READY) drawReadyScreen(now);

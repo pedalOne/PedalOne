@@ -228,11 +228,21 @@ void OnboardGps::serviceConfiguration(uint32_t now) {
       configDeadlineMs_ = now;
       break;
     case CONFIG_OUTPUTS: {
-      static const char *const commands[] = {
-          "$PAIR062,1,0*3F\r\n", "$PAIR062,2,5*39\r\n",
-          "$PAIR062,3,5*38\r\n", "$PAIR062,5,0*3B\r\n"};
-      if (outputCommand_ < sizeof(commands) / sizeof(commands[0])) {
-        if (sendPair(commands[outputCommand_])) ++outputCommand_;
+      // LC76G retains NMEA output settings through backup mode.  Configure
+      // every sentence the application relies on instead of assuming RMC is
+      // still at its factory default.  VTG supplies an independent Doppler
+      // speed path if an RMC sentence is temporarily invalid or omitted.
+      static const char *const commandBodies[] = {
+          "PAIR062,0,1",  // GGA: position/fix quality every solution.
+          "PAIR062,1,0",  // GLL: unused.
+          "PAIR062,2,5",  // GSA: dilution/fix type every five solutions.
+          "PAIR062,3,5",  // GSV: satellites every five solutions.
+          "PAIR062,4,1",  // RMC: time, position, speed, and course.
+          "PAIR062,5,1"   // VTG: redundant speed and course.
+      };
+      if (outputCommand_ <
+          sizeof(commandBodies) / sizeof(commandBodies[0])) {
+        if (sendPairBody(commandBodies[outputCommand_])) ++outputCommand_;
         configDeadlineMs_ = now + 150;
       } else {
         configStage_ = CONFIG_QUERY;
@@ -351,11 +361,13 @@ void OnboardGps::service(uint32_t now) {
   }
   serviceAdaptiveRate(millis());
   now=millis();
-  if(now-lastDiagnosticMs_>=5000 && Serial && Serial.availableForWrite()>=160) {
+  if(now-lastDiagnosticMs_>=5000 && Serial && Serial.availableForWrite()>=192) {
     lastDiagnosticMs_=now;
-    Serial.printf("GPS stage=%u NMEA=%lu ms fix=%u quality=%u sats=%u readErrors=%u\n",
+    Serial.printf("GPS stage=%u NMEA=%lu ms fix=%u quality=%u sats=%u speed=%.2fkn hdop=%.1f readErrors=%u\n",
         unsigned(configStage_), lastNmeaMs_ ? (unsigned long)(now-lastNmeaMs_) : 999999UL,
-        unsigned(fixFresh(now)),unsigned(fixQuality_),unsigned(satellites_),unsigned(readFailures_));
+        unsigned(fixFresh(now)),unsigned(fixQuality_),unsigned(satellites_),
+        isfinite(speedKnots_) ? speedKnots_ : -1.0f,
+        isfinite(hdop_) ? hdop_ : -1.0f,unsigned(readFailures_));
   }
 }
 
@@ -391,6 +403,7 @@ void OnboardGps::parseNmea(char *line, uint32_t now) {
   const char *type = length >= 3 ? fields[0] + length - 3 : "";
   if (!strcmp(type, "GGA")) parseGga(fields, count, now);
   else if (!strcmp(type, "RMC")) parseRmc(fields, count, now);
+  else if (!strcmp(type, "VTG")) parseVtg(fields, count, now);
   else if (!strcmp(type, "GSA")) parseGsa(fields, count, now);
   else if (!strcmp(fields[0], "$PAIR051") && count >= 2) {
     const int reportedInterval = atoi(fields[1]);
@@ -432,6 +445,20 @@ void OnboardGps::parseRmc(char *fields[], int count, uint32_t now) {
   lastPositionMs_ = now;
   lastFixSentenceMs_ = now;
   publishFix(now);
+}
+
+void OnboardGps::parseVtg(char *fields[], int count, uint32_t now) {
+  if (count < 8) return;
+  // NMEA VTG fields 5 and 7 are speed in knots and km/h respectively. Prefer
+  // knots to match RMC, with km/h as a standards-compliant fallback.
+  float knots = *fields[5] ? atof(fields[5]) : NAN;
+  if (!isfinite(knots) && *fields[7]) knots = atof(fields[7]) / 1.852f;
+  if (!isfinite(knots) || knots < 0.0f) return;
+  speedKnots_ = knots;
+  lastSpeedMs_ = now;
+  if (*fields[1]) courseDegrees_ = atof(fields[1]);
+  if (hasPosition_ && now - lastPositionMs_ <= FIX_STALE_MS)
+    publishFix(now);
 }
 
 void OnboardGps::parseGsa(char *fields[], int count, uint32_t now) {
