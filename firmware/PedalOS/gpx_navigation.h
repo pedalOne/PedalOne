@@ -6,12 +6,17 @@
 
 namespace gpx {
 constexpr float SPEED_MPS = 17.8816f;
+constexpr float JOIN_DISTANCE_METERS = 35.0f;
+constexpr float OFF_COURSE_DISTANCE_METERS = 60.0f;
+constexpr float COURSE_DIRECTION_LIMIT = 100.0f * 0.017453292519943295f;
 constexpr unsigned MAX_POINTS = 4096;
 constexpr double RAD = 0.017453292519943295;
 constexpr double EARTH = 6371000;
 struct Coordinate { int32_t latE7, lonE7; };
 static const GpxPoint *points = GPX_POINTS;
 static unsigned count = GPX_COUNT;
+// Optional meters above sea level, aligned one-for-one with route points.
+static const float *elevations = nullptr;
 static uint32_t revision=0;
 static double lat0 = GPX_LAT0, lon0 = GPX_LON0, lonScale = GPX_LON_SCALE;
 static char name[33] = "Hill Climb Clinic";
@@ -67,6 +72,37 @@ inline GpxPoint sample(float d) {
   const float t=(d-a.meters)/(b.meters-a.meters);
   return {a.east+(b.east-a.east)*t,a.north+(b.north-a.north)*t,d};
 }
+// Interpolate altitude only across known samples; missing GPX elevation is not zero.
+inline float elevationAt(float meters) {
+  if (!elevations) return NAN;
+  const float d=clamp(meters,0,length());
+  const unsigned i=segmentAt(d);
+  const float t=(d-points[i].meters)/(points[i+1].meters-points[i].meters);
+  if(t<=0) return elevations[i];
+  if(t>=1) return elevations[i+1];
+  if(!std::isfinite(elevations[i]) || !std::isfinite(elevations[i+1])) return NAN;
+  return elevations[i]+(elevations[i+1]-elevations[i])*t;
+}
+inline float routeGrade(float meters) {
+  // A 40 m baseline reduces point-to-point elevation noise. Endpoints use
+  // a one-sided baseline so the grade remains defined at start and finish.
+  const float span=length()<40 ? length() : 40;
+  const float start=clamp(meters-span/2,0,length()-span);
+  if(span<1) return NAN;
+  for(unsigned i=segmentAt(start);i<count && points[i].meters<=start+span;++i)
+    if(!elevations || !std::isfinite(elevations[i])) return NAN;
+  return 100*(elevationAt(start+span)-elevationAt(start))/span;
+}
+struct ProfileWindow { float start, end; };
+inline ProfileWindow profileWindow(float progress) {
+  constexpr float behind=804.672f, width=4023.36f; // 0.5 and 2.5 miles
+  const float lastStart=std::fmax(-behind,length()-width);
+  const float start=clamp(progress-behind,-behind,lastStart);
+  return {start,start+width};
+}
+inline unsigned gradeBand(float grade) {
+  return grade<0 ? 5 : grade<3 ? 0 : grade<5 ? 1 : grade<8 ? 2 : grade<10 ? 3 : 4;
+}
 inline float pointBearing(const GpxPoint &a,const GpxPoint &b) {
   return bearing(lat0+a.north/(EARTH*RAD),lon0+a.east/(EARTH*RAD*lonScale),
                  lat0+b.north/(EARTH*RAD),lon0+b.east/(EARTH*RAD*lonScale));
@@ -75,18 +111,25 @@ inline float pointDistance(const GpxPoint &a,const GpxPoint &b) {
   return distance(lat0+a.north/(EARTH*RAD),lon0+a.east/(EARTH*RAD*lonScale),
                   lat0+b.north/(EARTH*RAD),lon0+b.east/(EARTH*RAD*lonScale));
 }
-enum GuidanceMode { TO_START, ON_ROUTE, OFF_COURSE };
+enum GuidanceMode { TO_START, TO_ROUTE, ON_ROUTE, OFF_COURSE };
 struct Guidance {
-  bool joined=false, offCourse=false;
-  void reset() { joined=false;offCourse=false; }
-  void update(float distanceToStart,float offset) {
-    if(!joined && distanceToStart<=30)joined=true;
+  bool joined=false, offCourse=false, joiningAtStart=true;
+  void reset() { joined=false;offCourse=false;joiningAtStart=true; }
+  void update(float distanceToTarget,float offset,bool wrongWay=false,
+              float targetMeters=0) {
+    if(!joined) {
+      joiningAtStart=targetMeters<=30;
+      if(distanceToTarget<=JOIN_DISTANCE_METERS && !wrongWay)joined=true;
+    }
     if(joined) {
-      if(offset>50)offCourse=true;
-      else if(offset<25)offCourse=false;
+      if(offset>OFF_COURSE_DISTANCE_METERS || wrongWay)offCourse=true;
+      else if(offset<JOIN_DISTANCE_METERS && !wrongWay)offCourse=false;
     }
   }
-  GuidanceMode mode() const { return !joined ? TO_START : (offCourse ? OFF_COURSE : ON_ROUTE); }
+  GuidanceMode mode() const {
+    return !joined ? (joiningAtStart ? TO_START : TO_ROUTE)
+                   : (offCourse ? OFF_COURSE : ON_ROUTE);
+  }
 };
 inline float heading(float d) {
   const unsigned i=segmentAt(clamp(d,0,length()));
@@ -108,6 +151,24 @@ struct Simulation {
 };
 struct Cue { float meters,angle; };
 constexpr int PAGE_INDEX = 2;
+// A normal left/right begins at 45 degrees. The previous 60-degree boundary
+// made rounded 60-90 degree GPX corners appear as a slight-turn arrow after
+// their approach/departure bearings were averaged across 25 meters.
+inline bool slightTurn(float angle) { return std::fabs(angle)<45.0f*RAD; }
+struct GuidancePageAlert {
+  bool active=false,wasOffCourse=false,arrivalShown=false;
+  int returnPage=0;
+  void reset() {active=false;wasOffCourse=false;arrivalShown=false;returnPage=0;}
+  void dismiss(int &page) {if(active)page=returnPage;active=false;}
+  bool pending(bool off,bool arrived) const {return (arrived&&!arrivalShown)||(off&&!wasOffCourse);}
+  void update(bool off,bool arrived,int &page) {
+    const bool show=pending(off,arrived);
+    if(active && wasOffCourse && !off && !arrived)dismiss(page);
+    if(show && page!=PAGE_INDEX) {returnPage=page;page=PAGE_INDEX;active=true;}
+    wasOffCourse=off;
+    arrivalShown=arrivalShown||arrived;
+  }
+};
 struct TurnPreview {
   bool active=false;
   int returnPage=0;
@@ -146,21 +207,60 @@ inline Cue nextCue(float d) {
   }
   return cached;
 }
-inline float nearestDistance(float east,float north,float &offset,float previous=-1,float course=NAN) {
-  float best=1e30f,result=0,bestOffset=0;
+struct RouteMatch {
+  bool valid=false;
+  float meters=0;
+  float offset=INFINITY;
+  float tangent=NAN;
+};
+// Match only within an ordered slice of the GPX. This is deliberately not a
+// global nearest-point search: out-and-back routes often place the return leg
+// beside (or directly over) the outbound leg.
+inline RouteMatch nearestMatch(float east,float north,float minimum,float maximum,float course=NAN) {
+  RouteMatch result;
+  float best=1e30f;
+  minimum=clamp(minimum,0,length());
+  maximum=clamp(maximum,minimum,length());
   for(unsigned i=1;i<count;++i) {
     const auto &a=points[i-1],&b=points[i];
+    if(b.meters<minimum || a.meters>maximum)continue;
     const float x=b.east-a.east,y=b.north-a.north;
-    const float t=clamp(((east-a.east)*x+(north-a.north)*y)/(x*x+y*y),0,1);
+    const float geometrySquare=x*x+y*y;
+    const float segmentMeters=b.meters-a.meters;
+    if(geometrySquare<0.0001f || segmentMeters<=0)continue;
+    const float first=clamp((minimum-a.meters)/segmentMeters,0,1);
+    const float last=clamp((maximum-a.meters)/segmentMeters,first,1);
+    const float t=clamp(((east-a.east)*x+(north-a.north)*y)/geometrySquare,first,last);
     const float dx=east-a.east-t*x,dy=north-a.north-t*y;
     const float along=a.meters+t*(b.meters-a.meters);
     float square=dx*dx+dy*dy,score=square;
-    // Prefer continuity and the direction of travel on overlapping/out-and-back legs.
-    if(previous>=0) score+=std::pow(clamp(std::fabs(along-previous)-80,0,200),2);
-    if(score>=best)continue;
-    if(std::isfinite(course) && square<10000) score+=400*(1-std::cos(wrapAngle(pointBearing(a,b)-course)));
-    if(score<best) { best=score;result=along;bestOffset=square; }
+    const float tangent=pointBearing(a,b);
+    // At crossings and hairpins, travel direction breaks geometric ties.
+    if(std::isfinite(course) && square<22500)
+      score+=625*(1-std::cos(wrapAngle(tangent-course)));
+    if(score<best) {
+      best=score;
+      result={true,along,std::sqrt(square),tangent};
+    }
   }
-  offset=std::sqrt(bestOffset); return result;
+  return result;
+}
+// Recovery guidance is a purely geometric projection. It deliberately ignores
+// ordered-progress and heading penalties so the arrow terminates at the actual
+// closest tangent point anywhere on the GPX polyline.
+inline RouteMatch nearestTangent(float east,float north) {
+  return nearestMatch(east,north,0,length(),NAN);
+}
+inline bool wrongDirection(const RouteMatch &match,float course) {
+  return std::isfinite(course) && std::isfinite(match.tangent) &&
+      std::fabs(wrapAngle(match.tangent-course))>COURSE_DIRECTION_LIMIT;
+}
+inline bool canGloballyRejoin(const RouteMatch &match,float course,
+                              float previousProgress) {
+  if(!match.valid || match.offset>=JOIN_DISTANCE_METERS || wrongDirection(match,course))
+    return false;
+  // Heading is required for a large jump so an overlapping outbound/return
+  // leg cannot be selected merely because the rider is stationary nearby.
+  return std::isfinite(course) || std::fabs(match.meters-previousProgress)<=300.0f;
 }
 } // namespace gpx

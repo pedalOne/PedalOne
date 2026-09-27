@@ -56,6 +56,7 @@ class OnboardGps {
   void parseNmea(char *line, uint32_t now);
   void parseGga(char *fields[], int count, uint32_t now);
   void parseRmc(char *fields[], int count, uint32_t now);
+  void parseVtg(char *fields[], int count, uint32_t now);
   void parseGsa(char *fields[], int count, uint32_t now);
   void publishFix(uint32_t now);
   void setClockFromGps(const char *utc, const char *date);
