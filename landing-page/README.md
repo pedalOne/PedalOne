@@ -23,4 +23,10 @@ Connect the domain using the DNS records supplied by your chosen host, and enabl
 
 The separate Sites publication is https://pedalone-ride-as-one.paulp3.chatgpt.site/. Changes pushed here do not automatically update that publication.
 
-Google Fonts is the only external styling dependency. The page links to Instagram and includes no analytics, forms, checkout, or backend. Pricing is a target; roadmap features are not launch promises.
+Google Fonts is the only external styling dependency. The page links to Instagram and includes no analytics, checkout, or backend. Pricing is a target; roadmap features are not launch promises.
+
+## Email signup preview
+
+The email signup form is a design preview only. It validates email format but does not store or transmit email addresses or subscribe visitors. Its visible warning and submission message intentionally make this clear.
+
+Before enabling signup, connect a mailing-list provider such as MailerLite or Brevo, configure consent and confirmation/unsubscribe handling, and test the complete flow. Replace the preview submit handler in `dist/app.js` with the provider integration. Remove the preview warning only after the connection works; never embed private API keys in browser code.

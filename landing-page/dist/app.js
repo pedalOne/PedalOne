@@ -1,7 +1,7 @@
 const screens = {
-  map: { number: '01 / NAVIGATE', title: 'Less guessing.\nMore going.', description: 'Turn-by-turn directions and a full-color map keep the next turn in view. Take the scenic route with a little more confidence.', alt: 'PedalOne on bicycle handlebars showing turn-by-turn navigation' },
-  speed: { number: '02 / RIDE', title: 'Your effort.\nIn full color.', description: 'Keep your speed front and center, with ride metrics a glance away. Set your own pace, from the easy spin to the next personal challenge.', alt: 'PedalOne on bicycle handlebars showing a colorful speedometer and ride metrics' },
-  climb: { number: '03 / CLIMB', title: 'A little perspective.\nFor the uphill miles.', description: 'Bring the climb into view with a dedicated elevation screen. Find your rhythm and take the next stretch one pedal stroke at a time.', alt: 'PedalOne on bicycle handlebars showing its climbing and elevation screen' }
+  map: { number: '01 / NAVIGATE', title: 'Less guessing.\nMore going.', description: 'Full-color maps and turn-by-turn directions keep the next turn in view.', alt: 'PedalOne on bicycle handlebars showing turn-by-turn navigation' },
+  speed: { number: '02 / RIDE', title: 'Your effort.\nIn full color.', description: 'Your speed front and center, with ride metrics a glance away.', alt: 'PedalOne on bicycle handlebars showing a colorful speedometer and ride metrics' },
+  climb: { number: '03 / CLIMB', title: 'A little perspective.\nFor the uphill miles.', description: 'See the climb ahead on a dedicated elevation screen.', alt: 'PedalOne on bicycle handlebars showing its climbing and elevation screen' }
 };
 document.querySelectorAll('[data-screen]').forEach(button => {
   button.addEventListener('click', () => {
@@ -64,3 +64,9 @@ window.addEventListener('resize', measureHeader);
 window.addEventListener('load', measureHeader);
 window.addEventListener('hashchange', queueSectionUpdate);
 measureHeader();
+
+// Local design preview: do not store or transmit submitted email addresses.
+document.getElementById('updates-form').addEventListener('submit', event => {
+  event.preventDefault();
+  document.getElementById('signup-status').textContent = 'Preview only — your email has not been saved or subscribed. Signup will be enabled once a mailing-list service is connected.';
+});
