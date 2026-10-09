@@ -13,7 +13,13 @@ From this folder, run `python3 -m http.server 4173 --directory dist` and open ht
 - `dist/app.js`: screen selector and section navigation.
 - `dist/assets/`: logo and product images, including animated GIFs.
 
-## Hosting with your GoDaddy domain
+## GitHub Pages and your GoDaddy domain
+
+The `Deploy PedalOne landing page` workflow publishes only `landing-page/dist/` when that folder or the workflow changes on `main`. It can also be run manually from GitHub Actions. In Settings → Pages, select GitHub Actions as the publishing source. The radar portal is not published.
+
+Set `pedal-one.com` as the custom domain in Pages settings, then configure its GoDaddy DNS records using GitHub's current custom-domain instructions. Enable Enforce HTTPS after the certificate is ready. Domain setup remains a separate manual step.
+
+### Other hosting options
 
 A domain registration alone does not include file hosting. Use a static hosting service or a hosting plan that accepts uploaded website files.
 
